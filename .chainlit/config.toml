@@ -55,10 +55,10 @@ max_size_mb = 500
 sample_rate = 24000
 
 [features.mcp.sse]
-enabled = true
+enabled = false
 
 [features.mcp.stdio]
-enabled = true
+enabled = false
 # Only the executables in the allow list can be used for MCP stdio server.
 # Only need the base name of the executable, e.g. "npx", not "/usr/bin/npx".
 # Please don't comment this line for now, we need it to parse the executable name.
@@ -69,6 +69,12 @@ allowed_executables = ["npx", "uvx"]
 name = "Personal Assistant"
 
 default_theme = "light"
+[UI.theme.light]
+    logo = "/public/logo_light.png"
+    primary = "#446afe"
+[UI.theme.dark]
+    logo = "/public/logo_dark.png"
+    primary = "#446afe"
 
 # layout = "wide"
 
@@ -95,7 +101,7 @@ cot = "full"
 # custom_js_attributes = "async type = \"module\""
 
 # Custom login page image, relative to public directory or external URL
-login_page_image = "/public/logo_dark.png"
+login_page_image = "/public/icon.png"
 
 # Custom login page image filter (Tailwind internal filters, no dark/light variants)
 # login_page_image_filter = "brightness-50"
