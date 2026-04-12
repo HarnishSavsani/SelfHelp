@@ -1,6 +1,11 @@
 /* ===== Hide "Built with" watermark ===== */
-.watermark {
+.watermark,
+[class*="watermark"],
+a[href*="chainlit.io"],
+a[href*="github.com/Chainlit"] {
     display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
 }
 
 /* ===== Hide Readme button ===== */
