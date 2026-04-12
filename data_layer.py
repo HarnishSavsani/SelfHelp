@@ -366,7 +366,7 @@ class SQLiteDataLayer(BaseDataLayer):
             "SELECT user_identifier FROM threads WHERE id = ?", (thread_id,)
         ) as cursor:
             row = await cursor.fetchone()
-            return row["user_identifier"] if row else ""
+            return row["user_identifier"] if row and row["user_identifier"] else ""
 
     async def delete_thread(self, thread_id: str):
         db = await self._get_db()
@@ -613,6 +613,14 @@ class SQLiteDataLayer(BaseDataLayer):
             if user_id is not None:
                 updates.append("user_id = ?")
                 params.append(user_id)
+                # Also update user_identifier
+                async with db.execute(
+                    "SELECT identifier FROM users WHERE id = ?", (user_id,)
+                ) as cursor:
+                    user_row = await cursor.fetchone()
+                    if user_row:
+                        updates.append("user_identifier = ?")
+                        params.append(user_row["identifier"])
             if metadata is not None:
                 updates.append("metadata = ?")
                 params.append(json.dumps(metadata))
@@ -643,12 +651,12 @@ class SQLiteDataLayer(BaseDataLayer):
 async def seed_default_users(data_layer: SQLiteDataLayer):
     """Seed default users if they don't exist."""
     default_users = [
-        ("admin", "admin", "ADMIN"),
-        ("Harnish", "Pass@1234", "USER"),
-        ("Hrishikesh", "Pass@1234", "USER"),
-        ("Sarvesh", "Pass@1234", "USER"),
-        ("Aniket", "Pass@1234", "USER"),
-        ("Avnish", "Pass@1234", "USER"),
+        ("admin@genius.ai", "admin", "ADMIN"),
+        ("harnish@genius.ai", "Pass@1234", "USER"),
+        ("hrishikesh@genius.ai", "Pass@1234", "USER"),
+        ("sarvesh@genius.ai", "Pass@1234", "USER"),
+        ("aniket@genius.ai", "Pass@1234", "USER"),
+        ("avnish@genius.ai", "Pass@1234", "USER"),
     ]
 
     for identifier, password, role in default_users:
