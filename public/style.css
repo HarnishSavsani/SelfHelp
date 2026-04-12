@@ -1,0 +1,22 @@
+/* ===== Hide "Built with" watermark ===== */
+.watermark {
+    display: none !important;
+}
+
+/* ===== Hide Readme button ===== */
+#readme-button,
+a[href*="readme"],
+button[id*="readme"] {
+    display: none !important;
+}
+
+/* ===== Bigger login page icon ===== */
+.login-page-image,
+[class*="loginPageImage"],
+[class*="login"] img {
+    max-width: 320px !important;
+    max-height: 320px !important;
+    width: 320px !important;
+    height: auto !important;
+    object-fit: contain !important;
+}
