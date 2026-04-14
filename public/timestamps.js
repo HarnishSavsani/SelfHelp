@@ -27,18 +27,21 @@
     }
 
     function processMessages() {
-        // Target both user and assistant message steps
+        // Target Chainlit message steps using robust selectors
         const messages = document.querySelectorAll(
-            '[class*="message"]:not([data-ts-processed])'
+            '.step:not([data-ts-processed]), [class*="message"]:not([data-ts-processed])'
         );
 
         messages.forEach((msg) => {
-            // Only add timestamps to actual chat message bubbles
+            // Check if it's a message bubble
+            // In Chainlit, user messages and assistant messages usually reside in a container
             const isUserMsg = msg.closest('[class*="user"]') || msg.getAttribute('data-testid')?.includes('user');
-            const isAssistantMsg = msg.closest('[class*="assistant"]') || msg.getAttribute('data-testid')?.includes('assistant');
+            const isAssistantMsg = msg.closest('[class*="assistant"]') || msg.getAttribute('data-testid')?.includes('assistant') || msg.closest('.step') !== null;
 
             if (isUserMsg || isAssistantMsg) {
-                addTimestamp(msg);
+                // To avoid placing timestamp in tiny nested divs, place it at the main step container if possible
+                const targetEl = msg.querySelector('.message-content') || msg;
+                addTimestamp(targetEl);
                 msg.setAttribute('data-ts-processed', 'true');
             }
         });
@@ -49,8 +52,15 @@
         let shouldProcess = false;
         for (const m of mutations) {
             if (m.addedNodes.length > 0) {
-                shouldProcess = true;
-                break;
+                for (const node of m.addedNodes) {
+                    if (node.nodeType === 1 && (node.className?.includes?.('message') || node.className?.includes?.('step'))) {
+                        shouldProcess = true;
+                        break;
+                    } else if (node.nodeType === 1 && node.querySelector && (node.querySelector('.step') || node.querySelector('[class*="message"]'))) {
+                        shouldProcess = true;
+                        break;
+                    }
+                }
             }
         }
         if (shouldProcess) {
@@ -62,7 +72,9 @@
     function init() {
         const target = document.getElementById('root') || document.body;
         observer.observe(target, { childList: true, subtree: true });
-        processMessages();
+        // process immediately in case messages are already rendered
+        setTimeout(processMessages, 500);
+        setInterval(processMessages, 3000); // Fail-safe check
     }
 
     if (document.readyState === 'loading') {
