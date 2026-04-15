@@ -55,6 +55,7 @@ from config import (
     UNSTRUCTURED_EXTENSIONS,
     STRUCTURED_EXTENSIONS,
 )
+from app_profile import profile
 
 logger = logging.getLogger(__name__)
 
@@ -621,8 +622,9 @@ class RAGEngine:
             )
 
             # --- Response synthesis prompt ---
+            data_label = profile.data_source_label
             response_synthesis_prompt = PromptTemplate(
-                "You are a helpful data analyst assistant. The user uploaded a spreadsheet/data file "
+                "You are a helpful data analyst assistant. The user uploaded a data file "
                 "and asked a question. You analyzed their data and got a result.\n\n"
                 "Now compose a clear, friendly, natural language response.\n\n"
                 "ABSOLUTE RULES:\n"
@@ -631,8 +633,8 @@ class RAGEngine:
                 "3. NEVER mention 'database', 'table', 'SQL', 'query', or any technical terms.\n"
                 "4. NEVER say 'run this query', 'execute', or suggest the user do anything technical.\n"
                 "5. NEVER show any SQL code in your response.\n"
-                "6. Refer to the data source as 'your data', 'your spreadsheet', or "
-                f"'{source_desc}' — NEVER as 'database' or 'table'.\n"
+                f"6. Refer to the data source as '{data_label}' — "
+                "NEVER as 'database' or 'table'.\n"
                 "7. Use friendly formatting: bullet points, bold numbers, emojis where appropriate.\n"
                 "8. If listing items, show names/descriptions — NEVER raw IDs.\n\n"
                 "Question: {query_str}\n"
@@ -782,17 +784,18 @@ class RAGEngine:
         """Post-process: replace technical jargon with user-friendly language."""
         source_desc = self._get_source_files_description()
 
-        # Replace "database" references
+        # Replace "database" references with profile-appropriate labels
+        data_label = profile.data_source_label
         replacements = [
-            (r'\b[Tt]he database\b', 'your data'),
-            (r'\b[Ii]n the database\b', f'in {source_desc}'),
-            (r'\b[Ff]rom the database\b', f'from {source_desc}'),
-            (r'\b[Oo]ur database\b', 'your data'),
-            (r'\b[Tt]he table\b', 'your data'),
-            (r'\b[Ii]n the table\b', f'in {source_desc}'),
-            (r'\b[Ff]rom the table\b', f'from {source_desc}'),
-            (r'\baccording to the database\b', f'based on {source_desc}'),
-            (r'\bAccording to the database\b', f'Based on {source_desc}'),
+            (r'\b[Tt]he database\b', data_label),
+            (r'\b[Ii]n the database\b', f'in {data_label}'),
+            (r'\b[Ff]rom the database\b', f'from {data_label}'),
+            (r'\b[Oo]ur database\b', data_label),
+            (r'\b[Tt]he table\b', data_label),
+            (r'\b[Ii]n the table\b', f'in {data_label}'),
+            (r'\b[Ff]rom the table\b', f'from {data_label}'),
+            (r'\baccording to the database\b', f'based on {data_label}'),
+            (r'\bAccording to the database\b', f'Based on {data_label}'),
         ]
         for pattern, replacement in replacements:
             answer = re.sub(pattern, replacement, answer)

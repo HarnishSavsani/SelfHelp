@@ -20,6 +20,11 @@ load_dotenv()
 # Options: "ollama", "azure_custom"
 ACTIVE_LLM_PROVIDER = os.getenv("ACTIVE_LLM_PROVIDER", "ollama")
 
+# ── Application Profile ───────────────────────────────────────────
+# Profile name maps to profiles/{name}.yaml
+# Examples: "default", "insurance_claims", "customer_support"
+APP_PROFILE = os.getenv("APP_PROFILE", "default")
+
 # ── Storage Paths ─────────────────────────────────────────────────
 BASE_STORAGE_DIR = Path("./storage/rag")
 CHROMA_DB_DIR    = BASE_STORAGE_DIR / "chroma_db"

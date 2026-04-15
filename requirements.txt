@@ -19,3 +19,4 @@ llama-index-vector-stores-chroma>=0.4.0
 duckdb>=1.0.0
 duckdb-engine>=0.15.0
 sentence-transformers>=3.0.0
+pyyaml>=6.0

@@ -1,18 +1,26 @@
-# Genius AI - Structured & Unstructured RAG
+# Genius AI — Config-Driven RAG Framework
 
-A production-ready RAG (Retrieval-Augmented Generation) assistant built with Chainlit and LlamaIndex. It handles both structured data (Excel, CSV, JSON) using DuckDB and unstructured documents (PDF, MD, TXT) using ChromaDB.
+A production-ready, open-source RAG (Retrieval-Augmented Generation) framework built with **Chainlit** and **LlamaIndex**. Switch between domain-specific applications (Insurance, Medical, Customer Support, etc.) by changing a single config line.
+
+## ✨ Key Features
+
+- **Dual RAG Pipeline** — Structured data (Excel/CSV/JSON → DuckDB SQL) + Unstructured docs (PDF/MD/TXT → ChromaDB vectors)
+- **Config-Driven Profiles** — One YAML file per application. Change `APP_PROFILE=insurance_claims` in `.env` and restart.
+- **Built-in Guardrails** — Domain-specific topic filtering (no LLM call, pure keyword matching for speed)
+- **Smart SQL Synthesis** — Natural language answers from data queries, never raw SQL or technical jargon
+- **Persistent Sessions** — Upload files once, query across chat sessions
+
+---
 
 ## 🚀 Quick Start with `uv`
 
-We recommend using [uv](https://github.com/astral-sh/uv) for extremely fast environment management.
+We recommend [uv](https://github.com/astral-sh/uv) for fast environment management.
 
 ### 1. Install `uv` (if not present)
 
-If you don't have `uv` installed, run one of the following:
-
 **macOS/Linux:**
 ```bash
-curl -LsSf https://astral-sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 **Homebrew:**
@@ -22,57 +30,130 @@ brew install uv
 
 **Windows:**
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral-sh/uv/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
 ### 2. Setup Environment
 
-Once `uv` is installed, run the following to create a virtual environment and install dependencies:
-
 ```bash
-# Recreate venv and install dependencies from pyproject.toml
+# Clone the repo
+git clone <your-repo-url>
+cd chainlit
+
+# Create venv and install all dependencies
 uv sync
 
 # OR using requirements.txt
-uv pip install -r requirements.txt
+uv venv && uv pip install -r requirements.txt
 ```
 
-### 3. Configure Environment Variables
-
-Copy `.env.example` to `.env` and fill in your details:
+### 3. Configure
 
 ```bash
 cp .env.example .env
 ```
 
-Ensure `OLLAMA_MODEL` is set to `qwen2.5:7b` (or your preferred model).
+Edit `.env` to set your model and profile:
+```env
+OLLAMA_MODEL=qwen2.5:7b
+APP_PROFILE=default          # or: insurance_claims, customer_support
+```
 
-### 4. Run the Application
+### 4. Run
 
 ```bash
 source .venv/bin/activate
 chainlit run app.py
 ```
 
+---
+
 ## 🛠 Manual Setup (without `uv`)
 
-If you prefer using standard `pip`:
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env               # Edit with your settings
+chainlit run app.py
+```
 
-1.  **Create venv**: `python -m venv .venv`
-2.  **Activate**: `source .venv/bin/activate` (or `.venv\Scripts\activate` on Windows)
-3.  **Install**: `pip install -r requirements.txt`
+---
 
-## 📦 Features
+## 🎭 Application Profiles
 
--   **Structured RAG**: Powered by DuckDB. Automatically detects schemas and performs NL-to-SQL.
--   **Unstructured RAG**: Powered by ChromaDB. Semantic search across PDFs and text files.
--   **Smart Fallbacks**: Robust error handling for SQL generation and execution.
--   **Production Synthesis**: Natural language responses that avoid technical jargon (e.g., "database", "SQL").
+Profiles let you turn this generic RAG into a **domain-specific assistant** by changing one line in `.env`.
+
+### How It Works
+
+```
+profiles/
+├── default.yaml              # Generic RAG — no guardrails
+├── insurance_claims.yaml     # Insurance claims analyst
+└── customer_support.yaml     # Support ticket analyzer
+```
+
+Each profile controls:
+| Feature | Example |
+|---|---|
+| **App Name** | "ClaimAssist AI", "SupportIQ" |
+| **System Prompt** | Domain-specific personality and rules |
+| **Guardrails** | Blocked/allowed topics, strictness level |
+| **Welcome Message** | Custom onboarding for the domain |
+| **Data Labels** | "your claim data" vs "your support tickets" |
+| **File Restrictions** | Which file types are accepted |
+
+### Switching Profiles
+
+```bash
+# In .env — just change this line:
+APP_PROFILE=insurance_claims
+```
+
+Then restart:
+```bash
+chainlit run app.py
+```
+
+### Creating Your Own Profile
+
+1. Copy `profiles/default.yaml` to `profiles/my_domain.yaml`
+2. Edit the YAML to define your domain's personality, topics, and guardrails
+3. Set `APP_PROFILE=my_domain` in `.env`
+4. Restart the app
+
+### Guardrail Strictness Levels
+
+| Level | Behavior |
+|---|---|
+| `relaxed` | No filtering — all queries pass (default profile) |
+| `moderate` | Blocks explicitly forbidden topics, allows everything else |
+| `strict` | Only allows queries matching defined allowed topics |
+
+---
 
 ## 📂 Project Structure
 
--   `app.py`: Main Chainlit application and UI logic.
--   `rag_engine.py`: Core RAG logic, routing, and SQL execution.
--   `data_layer.py`: Persistence and user session management.
--   `llm_factory.py`: Configuration for Ollama and Embedding models.
--   `storage/`: Persistent data for ChromaDB and DuckDB.
+```
+├── app.py                  # Chainlit UI, auth, message handling
+├── rag_engine.py           # Core RAG logic, SQL/vector routing
+├── app_profile.py          # Profile loader and guardrail engine
+├── llm_factory.py          # LLM/embedding model configuration
+├── data_layer.py           # SQLite persistence and auth
+├── config.py               # Central config (env vars, paths)
+├── profiles/               # Domain-specific YAML profiles
+│   ├── default.yaml
+│   ├── insurance_claims.yaml
+│   └── customer_support.yaml
+├── storage/                # Persistent data (auto-created)
+├── requirements.txt        # Pip dependencies
+└── pyproject.toml          # UV/project metadata
+```
+
+---
+
+## 📦 Requirements
+
+- **Python** ≥ 3.12
+- **Ollama** running locally (or Azure endpoint configured)
+- Recommended model: `qwen2.5:7b` (pull via `ollama pull qwen2.5:7b`)

@@ -25,6 +25,7 @@ from data_layer import SQLiteDataLayer, seed_default_users
 from llm_factory import setup_global_llm
 from rag_engine import RAGEngine
 from config import ACTIVE_LLM_PROVIDER, OLLAMA_CONFIG
+from app_profile import profile
 
 # ── Global settings ───────────────────────────────────────────────
 logger = logging.getLogger(__name__)
@@ -32,21 +33,6 @@ logger = logging.getLogger(__name__)
 # ── Context Engineering Constants ─────────────────────────────────
 MAX_RECENT_MESSAGES  = 10
 SUMMARIZE_THRESHOLD  = 15
-
-BASE_SYSTEM_PROMPT = """\
-You are Genius AI, a highly capable conversational assistant. 🧠✨
-
-Your core capabilities:
-- Answer questions thoughtfully and helpfully.
-- Respond with accurate information.
-
-Guidelines:
-- Explain findings clearly with numbers, percentages, and context if applicable.
-- Always be polite and professional.
-- Use structured formatting (bullet points, tables where appropriate) for clarity.
-- Use colorful emojis to make responses engaging and readable 🚀
-- When asked about prior conversation, rely on the provided conversation summary. 📜
-"""
 
 # ── Data Layer ────────────────────────────────────────────────────
 _data_layer_instance = SQLiteDataLayer()
@@ -113,6 +99,10 @@ async def _on_chat_start():
             ]
         ).send()
 
+    # 3. Send profile-specific welcome message
+    if profile.welcome_message:
+        await cl.Message(content=profile.welcome_message).send()
+
 
 # ── Auth ──────────────────────────────────────────────────────────
 
@@ -168,6 +158,13 @@ async def on_message(message: cl.Message):
         for element in message.elements:
             if hasattr(element, "path") and element.path:
                 file_name = element.name or os.path.basename(element.path)
+
+                # Check if file type is allowed by profile
+                file_allowed, file_msg = profile.is_file_allowed(file_name)
+                if not file_allowed:
+                    await cl.Message(content=file_msg).send()
+                    continue
+
                 logger.info(f"Processing uploaded file: {file_name}")
 
                 processing_msg = cl.Message(
@@ -184,9 +181,19 @@ async def on_message(message: cl.Message):
             await generate_rag_answer(message.content)
         return
 
-    # ── Handle queries (RAG or direct) ──────────────────────────
+    # ── Guardrail check ─────────────────────────────────────────
     rag_engine: RAGEngine = cl.user_session.get("rag_engine")
-    if rag_engine and rag_engine.has_data():
+    has_data = rag_engine is not None and rag_engine.has_data()
+
+    is_allowed, rejection_msg = profile.check_guardrails(
+        message.content, has_data=has_data
+    )
+    if not is_allowed:
+        await cl.Message(content=rejection_msg).send()
+        return
+
+    # ── Handle queries (RAG or direct) ──────────────────────────
+    if has_data:
         await generate_rag_answer(message.content)
     else:
         await generate_answer(message.content)
@@ -254,7 +261,7 @@ async def on_chat_resume(thread: ThreadDict):
     user = cl.user_session.get("user")
     logger.info(f"{user} resumed chat")
 
-    welcome_content = "👋 **Welcome back!** Your conversation history has been restored.\n"
+    welcome_content = f"👋 **Welcome back!** Your conversation history has been restored.\n"
     if files_summary:
         welcome_content += f"\n📎 **Your uploaded data is ready to query:**\n{files_summary}\n"
     welcome_content += "\nFeel free to continue chatting!"
@@ -282,12 +289,9 @@ def _build_context_messages(
     summary: str,
     recent_messages: List[dict],
 ) -> List[ChatMessage]:
-    messages       = []
-    system_content = BASE_SYSTEM_PROMPT
+    system_content = profile.get_system_prompt_with_summary(summary)
 
-    if summary:
-        system_content += f"\n\n## Previous Conversation Summary\n{summary}"
-
+    messages = []
     messages.append(ChatMessage(role=MessageRole.SYSTEM, content=system_content))
 
     for m in recent_messages:
