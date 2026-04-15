@@ -13,13 +13,16 @@ import os
 import sys
 import shutil
 
+# Add parent directory to path since script was moved to helper_scripts
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 
-# Ensure .env is loaded for GROQ_API_KEY
+# Ensure .env is loaded
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 
-from llama_index.llms.groq import Groq
+from llm_factory import setup_global_llm
 from rag_engine import RAGEngine
 
 TEST_THREAD_ID = "_test_phase2"
@@ -107,14 +110,14 @@ async def test_query_routing(engine: RAGEngine):
     return True
 
 
-async def test_persistence(llm):
+async def test_persistence():
     """Test: Close engine → reopen → verify data persists."""
     print("\n" + "=" * 60)
     print("TEST 4: Persistence (close → reopen → verify)")
     print("=" * 60)
 
-    # Attempt to restore from storage
-    engine2 = RAGEngine.load_from_storage(TEST_THREAD_ID, llm)
+    # Attempt to restore from storage (no LLM argument needed)
+    engine2 = RAGEngine.load_from_storage(TEST_THREAD_ID)
     if engine2 is None:
         print("❌ load_from_storage returned None")
         return False
@@ -139,16 +142,17 @@ async def main():
     print("🧪 RAG Engine Phase 2 — End-to-End Test")
     print("=" * 60)
 
-    llm = Groq(model="llama-3.3-70b-versatile", temperature=0, max_retries=10)
+    # Setup the generic global LLM using factory
+    setup_global_llm()
 
     # Clean up previous test data
-    test_storage = f"./rag_storage/{TEST_THREAD_ID}"
+    test_storage = f"./storage/rag/{TEST_THREAD_ID}"
     if os.path.exists(test_storage):
         shutil.rmtree(test_storage)
         print(f"🧹 Cleaned previous test storage: {test_storage}")
 
-    # Create engine
-    engine = RAGEngine(thread_id=TEST_THREAD_ID, llm=llm)
+    # Create engine (does not need LLM argument anymore)
+    engine = RAGEngine(thread_id=TEST_THREAD_ID)
 
     results = {}
 
@@ -165,7 +169,7 @@ async def main():
     engine.close()
 
     # Test 4: Persistence
-    results["persistence"] = await test_persistence(llm)
+    results["persistence"] = await test_persistence()
 
     # Summary
     print("\n" + "=" * 60)
@@ -182,3 +186,4 @@ async def main():
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
+

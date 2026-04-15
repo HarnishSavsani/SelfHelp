@@ -1,0 +1,18 @@
+{
+  "thread_id": "7e0ee4c8-88a5-43d6-98dd-9674ebcdcb23",
+  "files": [
+    {
+      "name": "sample_retail_data.xlsx",
+      "type": "structured",
+      "ingested_at": "2026-04-15T18:34:16.841836+00:00",
+      "tables": [
+        "product"
+      ],
+      "total_rows": 50
+    }
+  ],
+  "vector_index_exists": false,
+  "sql_tables": [
+    "product"
+  ]
+}

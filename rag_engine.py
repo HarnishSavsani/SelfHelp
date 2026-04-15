@@ -7,7 +7,9 @@ Single-file RAG abstraction managing two pipelines:
 
 Design Principles:
   - One RAGEngine instance per chat session
-  - Thread-scoped persistence under ./rag_storage/{thread_id}/
+  - Thread-scoped persistence under rag_storage/chroma_db/{thread_id}
+    and rag_storage/duckdb/{thread_id}/
+  - LLM is resolved from LlamaIndex Settings (set by llm_factory)
   - Zero dependency on Chainlit internals (clean separation)
   - Incremental ingestion — files can be added mid-conversation
 """
@@ -32,8 +34,6 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.readers import SimpleDirectoryReader
-from llama_index.core.schema import Document
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from llama_index.core import SQLDatabase
@@ -43,69 +43,54 @@ from llama_index.core.selectors import LLMSingleSelector
 from llama_index.core.tools import QueryEngineTool
 from sqlalchemy import create_engine, text
 
+from config import (
+    CHROMA_DB_DIR,
+    DUCKDB_DIR,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    SIMILARITY_TOP_K,
+    MAX_FILE_SIZE_MB,
+    MAX_FILES_PER_SESSION,
+    MAX_DATAFRAME_ROWS,
+    UNSTRUCTURED_EXTENSIONS,
+    STRUCTURED_EXTENSIONS,
+)
+
 logger = logging.getLogger(__name__)
-
-# ── Configuration Constants ───────────────────────────────────────
-
-RAG_STORAGE_DIR = "./rag_storage"
-
-# Embedding
-EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-
-# Chunking
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 50
-
-# Retrieval
-SIMILARITY_TOP_K = 5
-
-# Limits
-MAX_FILE_SIZE_MB = 50
-MAX_FILES_PER_SESSION = 20
-MAX_DATAFRAME_ROWS = 500_000  # Safety limit for structured files
-
-# SQL Safety
-SQL_QUERY_TIMEOUT_SECONDS = 30
-
-# Supported Extensions
-UNSTRUCTURED_EXTENSIONS = {".pdf", ".txt", ".md"}
-STRUCTURED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".json"}
 
 
 class RAGEngine:
-    """Per-session RAG engine managing ChromaDB and DuckDB pipelines."""
+    """Per-session RAG engine managing ChromaDB and DuckDB pipelines.
 
-    def __init__(self, thread_id: str, llm, embed_model=None):
+    The LLM is NOT passed as a constructor argument. It is resolved
+    from LlamaIndex's global Settings.llm (set once by llm_factory).
+    """
+
+    def __init__(self, thread_id: str, embed_model=None):
         """
         Initialize with thread ID for persistence scoping.
 
         Args:
-            thread_id: Unique chat thread identifier (used for storage paths).
-            llm: LlamaIndex LLM instance (e.g., Groq).
-            embed_model: Optional custom embedding model. Defaults to BAAI/bge-small-en-v1.5.
+            thread_id:   Unique chat thread identifier.
+            embed_model: Optional custom embedding model override.
+                         Defaults to whatever is in Settings.embed_model.
         """
         self.thread_id = thread_id
-        self.llm = llm
 
-        # ── Storage paths ─────────────────────────────────────────
-        self.storage_dir = Path(RAG_STORAGE_DIR) / thread_id
-        self.chroma_dir = self.storage_dir / "chroma_db"
-        self.duckdb_path = self.storage_dir / "structured.duckdb"
-        self.source_files_dir = self.storage_dir / "source_files"
-        self.metadata_path = self.storage_dir / "metadata.json"
+        # ── Resolve LLM from global Settings ─────────────────────
+        self.llm = Settings.llm
+
+        # ── Storage paths (from config) ───────────────────────────
+        self.chroma_dir    = CHROMA_DB_DIR / thread_id
+        self.duckdb_path   = DUCKDB_DIR / thread_id / "structured.duckdb"
+        self.metadata_path = DUCKDB_DIR / thread_id / "metadata.json"
 
         # Ensure directories exist
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self.source_files_dir.mkdir(parents=True, exist_ok=True)
+        self.chroma_dir.mkdir(parents=True, exist_ok=True)
+        self.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
 
         # ── Embedding model ───────────────────────────────────────
-        self.embed_model = embed_model or HuggingFaceEmbedding(
-            model_name=EMBED_MODEL_NAME,
-        )
-
-        # ── Set global LlamaIndex defaults (prevents OpenAI fallback) ─
-        Settings.llm = self.llm
-        Settings.embed_model = self.embed_model
+        self.embed_model = embed_model or Settings.embed_model
 
         # ── ChromaDB (Vector Store) ───────────────────────────────
         self.chroma_client = chromadb.PersistentClient(
@@ -119,7 +104,6 @@ class RAGEngine:
         )
         self.vector_index: Optional[VectorStoreIndex] = None
 
-        # Build index from existing collection if it has data
         if self.chroma_collection.count() > 0:
             self.vector_index = VectorStoreIndex.from_vector_store(
                 vector_store=self.vector_store,
@@ -131,11 +115,11 @@ class RAGEngine:
             )
 
         # ── DuckDB (Structured SQL) ───────────────────────────────
-        self.sql_engine = None
+        self.sql_engine   = None
         self.sql_database: Optional[SQLDatabase] = None
-        self.sql_tables: list[str] = []
+        self.sql_tables:   list[str] = []
+        self.table_source_files: dict[str, str] = {}  # table_name → original filename
 
-        # Reconnect if DB file exists (uses SQLAlchemy only)
         if self.duckdb_path.exists():
             self._connect_duckdb()
             logger.info(
@@ -144,14 +128,13 @@ class RAGEngine:
             )
 
         # ── Query Routing ─────────────────────────────────────────
-        self.vector_query_engine = None
-        self.sql_query_engine = None
+        self.vector_query_engine  = None
+        self.sql_query_engine     = None
         self.router_query_engine: Optional[RouterQueryEngine] = None
 
         # ── File tracking ─────────────────────────────────────────
         self.metadata = self._load_metadata()
 
-        # Build router if we already have data
         if self.vector_index or self.sql_tables:
             self._rebuild_router()
 
@@ -162,89 +145,57 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     def _classify_file(self, file_name: str) -> str:
-        """
-        Classify a file as 'unstructured', 'structured', or 'unsupported'.
-
-        Args:
-            file_name: Name of the file (with extension).
-
-        Returns:
-            One of: 'unstructured', 'structured', 'unsupported'
-        """
         ext = Path(file_name).suffix.lower()
         if ext in UNSTRUCTURED_EXTENSIONS:
             return "unstructured"
         elif ext in STRUCTURED_EXTENSIONS:
             return "structured"
-        else:
-            return "unsupported"
+        return "unsupported"
 
     def _validate_file(self, file_path: str, file_name: str) -> Optional[str]:
-        """
-        Validate a file before ingestion.
-
-        Returns:
-            None if valid, or an error message string if invalid.
-        """
         path = Path(file_path)
-
-        # Check existence
         if not path.exists():
             return f"❌ File not found: `{file_name}`"
 
-        # Check size
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
             return (
                 f"❌ File `{file_name}` is too large ({size_mb:.1f} MB). "
                 f"Maximum allowed: {MAX_FILE_SIZE_MB} MB."
             )
-
-        # Check empty
         if path.stat().st_size == 0:
             return f"❌ File `{file_name}` is empty."
 
-        # Check total file count in session
         total_files = len(self.metadata.get("files", []))
         if total_files >= MAX_FILES_PER_SESSION:
             return (
                 f"❌ Maximum files per session reached ({MAX_FILES_PER_SESSION}). "
-                f"Please start a new chat to upload more files."
+                "Please start a new chat to upload more files."
             )
 
-        # Check extension
-        classification = self._classify_file(file_name)
-        if classification == "unsupported":
-            supported = ", ".join(
-                sorted(UNSTRUCTURED_EXTENSIONS | STRUCTURED_EXTENSIONS)
-            )
+        if self._classify_file(file_name) == "unsupported":
+            supported = ", ".join(sorted(UNSTRUCTURED_EXTENSIONS | STRUCTURED_EXTENSIONS))
             return (
                 f"❌ Unsupported file type for `{file_name}`. "
                 f"Supported formats: {supported}"
             )
-
-        return None  # Valid
+        return None
 
     # ══════════════════════════════════════════════════════════════
     # FILE PERSISTENCE & METADATA
     # ══════════════════════════════════════════════════════════════
 
     def _copy_source_file(self, file_path: str, file_name: str) -> Path:
-        """
-        Copy an uploaded file to the persistent source_files directory.
+        """Copy an uploaded file alongside the DuckDB directory."""
+        source_dir = self.duckdb_path.parent / "source_files"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        dest = source_dir / file_name
 
-        Returns:
-            Path to the copied file.
-        """
-        dest = self.source_files_dir / file_name
-
-        # Handle duplicate filenames by appending a number
         if dest.exists():
-            stem = dest.stem
-            suffix = dest.suffix
+            stem, suffix = dest.stem, dest.suffix
             counter = 2
             while dest.exists():
-                dest = self.source_files_dir / f"{stem}_{counter}{suffix}"
+                dest = source_dir / f"{stem}_{counter}{suffix}"
                 counter += 1
 
         shutil.copy2(file_path, dest)
@@ -252,7 +203,6 @@ class RAGEngine:
         return dest
 
     def _load_metadata(self) -> dict:
-        """Load or initialize the metadata.json file."""
         if self.metadata_path.exists():
             with open(self.metadata_path, "r") as f:
                 return json.load(f)
@@ -264,7 +214,6 @@ class RAGEngine:
         }
 
     def _save_metadata(self):
-        """Persist metadata.json to disk."""
         self.metadata["vector_index_exists"] = self.vector_index is not None
         self.metadata["sql_tables"] = list(self.sql_tables)
         with open(self.metadata_path, "w") as f:
@@ -280,8 +229,7 @@ class RAGEngine:
         tables: list[str] | None = None,
         total_rows: int = 0,
     ):
-        """Add a file entry to the metadata manifest."""
-        entry = {
+        entry: dict = {
             "name": file_name,
             "type": file_type,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
@@ -300,24 +248,14 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     def _connect_duckdb(self):
-        """
-        Establish connection to the DuckDB database file.
-
-        Uses SQLAlchemy as the sole persistent connection to avoid
-        DuckDB's dual-connection config conflict. Native duckdb is
-        used only transiently for DataFrame loading via _load_df_to_duckdb.
-        """
-        # Dispose any existing engine to avoid connection conflicts
         if self.sql_engine is not None:
             self.sql_engine.dispose()
 
-        # Create SQLAlchemy engine (sole persistent connection)
         self.sql_engine = create_engine(
             f"duckdb:///{self.duckdb_path}",
             pool_pre_ping=True,
         )
 
-        # Discover existing tables via SQLAlchemy
         with self.sql_engine.connect() as conn:
             tables_result = conn.execute(
                 text(
@@ -332,45 +270,25 @@ class RAGEngine:
                 self.sql_engine,
                 include_tables=self.sql_tables,
             )
+            # Rebuild source file mapping from metadata
+            for f in self.metadata.get("files", []):
+                if f.get("type") == "structured":
+                    for tbl in f.get("tables", []):
+                        self.table_source_files[tbl] = f["name"]
 
     # ══════════════════════════════════════════════════════════════
     # TABLE NAME & DATAFRAME CLEANING
     # ══════════════════════════════════════════════════════════════
 
     def _clean_table_name(self, name: str) -> str:
-        """
-        Sanitize a sheet/file name into a valid SQL table name.
-
-        Examples:
-            "Sales Data (Q4)" → "sales_data_q4"
-            "Sheet1" → "sheet1"
-            "my-file.csv" → "my_file"
-        """
-        # Remove file extension if present
         name = Path(name).stem if "." in name else name
-        # Replace non-alphanumeric chars with underscores
         name = re.sub(r"[^a-zA-Z0-9]", "_", name)
-        # Collapse multiple underscores
-        name = re.sub(r"_+", "_", name)
-        # Strip leading/trailing underscores and lowercase
-        name = name.strip("_").lower()
-        # Ensure it doesn't start with a number
+        name = re.sub(r"_+", "_", name).strip("_").lower()
         if name and name[0].isdigit():
             name = f"t_{name}"
-        # Fallback for empty names
-        if not name:
-            name = "unnamed_table"
-        return name
+        return name or "unnamed_table"
 
     def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Clean a DataFrame for SQL ingestion:
-          - Lowercase column names
-          - Replace special chars with underscores
-          - Drop fully-null columns
-          - Strip whitespace from string columns
-        """
-        # Clean column names
         new_cols = []
         for col in df.columns:
             cleaned = re.sub(r"[^a-zA-Z0-9]", "_", str(col))
@@ -381,8 +299,7 @@ class RAGEngine:
                 cleaned = f"col_{len(new_cols)}"
             new_cols.append(cleaned)
 
-        # Handle duplicate column names
-        seen = {}
+        seen: dict = {}
         final_cols = []
         for col in new_cols:
             if col in seen:
@@ -393,14 +310,9 @@ class RAGEngine:
                 final_cols.append(col)
 
         df.columns = final_cols
-
-        # Drop fully-null columns
         df = df.dropna(axis=1, how="all")
-
-        # Strip whitespace from string columns
         for col in df.select_dtypes(include=["object"]).columns:
             df[col] = df[col].str.strip()
-
         return df
 
     # ══════════════════════════════════════════════════════════════
@@ -408,26 +320,12 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     async def ingest_file(self, file_path: str, file_name: str) -> str:
-        """
-        Route a file to the correct ingestion pipeline.
-
-        Args:
-            file_path: Absolute or relative path to the uploaded file.
-            file_name: Original file name (used for classification & display).
-
-        Returns:
-            A user-facing status message string.
-        """
-        # Validate
         error = self._validate_file(file_path, file_name)
         if error:
             logger.warning(f"[{self.thread_id}] Validation failed for {file_name}: {error}")
             return error
 
-        # Copy to persistent storage
         self._copy_source_file(file_path, file_name)
-
-        # Classify and route
         file_type = self._classify_file(file_name)
         logger.info(f"[{self.thread_id}] Ingesting file: {file_name} ({file_type})")
 
@@ -436,15 +334,10 @@ class RAGEngine:
                 result = await self._ingest_unstructured(file_path, file_name)
             else:
                 result = await self._ingest_structured(file_path, file_name)
-
-            # Rebuild query router with new data sources
             self._rebuild_router()
             return result
-
         except Exception as e:
-            error_msg = (
-                f"❌ Failed to process `{file_name}`: {type(e).__name__}: {str(e)}"
-            )
+            error_msg = f"❌ Failed to process `{file_name}`: {type(e).__name__}: {e}"
             logger.error(f"[{self.thread_id}] {error_msg}", exc_info=True)
             return error_msg
 
@@ -453,58 +346,34 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     async def _ingest_unstructured(self, file_path: str, file_name: str) -> str:
-        """
-        Ingest an unstructured document into the ChromaDB vector store.
-
-        Steps:
-          1. Parse document using SimpleDirectoryReader
-          2. Chunk into nodes with SentenceSplitter
-          3. Tag with metadata (source, time, thread)
-          4. Embed and insert into ChromaDB via VectorStoreIndex
-        """
-        # Parse the document
-        reader = SimpleDirectoryReader(input_files=[file_path])
+        reader    = SimpleDirectoryReader(input_files=[file_path])
         documents = reader.load_data()
 
         if not documents:
             return f"⚠️ No content could be extracted from `{file_name}`."
 
-        # Add metadata to each document
         for doc in documents:
             doc.metadata.update({
                 "source_filename": file_name,
-                "upload_time": datetime.now(timezone.utc).isoformat(),
-                "thread_id": self.thread_id,
+                "upload_time":     datetime.now(timezone.utc).isoformat(),
+                "thread_id":       self.thread_id,
             })
 
-        # Chunk documents into nodes
-        splitter = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
-        nodes = splitter.get_nodes_from_documents(documents)
+        splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        nodes    = splitter.get_nodes_from_documents(documents)
+        logger.info(f"[{self.thread_id}] Created {len(nodes)} chunks from {file_name}")
 
-        logger.info(
-            f"[{self.thread_id}] Created {len(nodes)} chunks from {file_name}"
-        )
-
-        # Build or update the vector index
-        storage_context = StorageContext.from_defaults(
-            vector_store=self.vector_store,
-        )
+        storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
 
         if self.vector_index is None:
-            # First file — create new index
             self.vector_index = VectorStoreIndex(
                 nodes=nodes,
                 storage_context=storage_context,
                 embed_model=self.embed_model,
             )
         else:
-            # Subsequent files — insert into existing index
             self.vector_index.insert_nodes(nodes)
 
-        # Update metadata
         self._add_file_metadata(file_name, "unstructured", chunks=len(nodes))
 
         return (
@@ -518,45 +387,26 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     async def _ingest_structured(self, file_path: str, file_name: str) -> str:
-        """
-        Ingest structured data into DuckDB.
-
-        Steps:
-          1. Load file with Pandas (auto-detect format)
-          2. Clean DataFrame (column names, nulls, types)
-          3. Create SQL table in DuckDB from DataFrame
-          4. Rebuild NLSQLTableQueryEngine
-        """
-        ext = Path(file_name).suffix.lower()
+        ext            = Path(file_name).suffix.lower()
         tables_created = []
-        total_rows = 0
+        total_rows     = 0
 
         try:
             if ext in (".xlsx", ".xls"):
-                # Excel: each sheet becomes a table
                 sheets = pd.read_excel(file_path, sheet_name=None)
                 for sheet_name, df in sheets.items():
                     if df.empty:
-                        logger.warning(
-                            f"[{self.thread_id}] Empty sheet skipped: {sheet_name}"
-                        )
                         continue
                     if len(df) > MAX_DATAFRAME_ROWS:
-                        logger.warning(
-                            f"[{self.thread_id}] Sheet {sheet_name} truncated "
-                            f"to {MAX_DATAFRAME_ROWS} rows"
-                        )
                         df = df.head(MAX_DATAFRAME_ROWS)
-
                     table_name = self._clean_table_name(sheet_name)
                     df = self._clean_dataframe(df)
                     self._load_df_to_duckdb(df, table_name)
+                    self.table_source_files[table_name] = file_name
                     tables_created.append((table_name, len(df), list(df.columns)))
                     total_rows += len(df)
 
             elif ext == ".csv":
-                # CSV: file name becomes table name
-                # Try multiple encodings
                 df = None
                 for encoding in ("utf-8", "latin-1", "cp1252"):
                     try:
@@ -564,28 +414,24 @@ class RAGEngine:
                         break
                     except UnicodeDecodeError:
                         continue
-
                 if df is None:
                     return f"❌ Could not decode `{file_name}`. Unsupported encoding."
-
                 if len(df) > MAX_DATAFRAME_ROWS:
                     df = df.head(MAX_DATAFRAME_ROWS)
-
                 table_name = self._clean_table_name(file_name)
                 df = self._clean_dataframe(df)
                 self._load_df_to_duckdb(df, table_name)
+                self.table_source_files[table_name] = file_name
                 tables_created.append((table_name, len(df), list(df.columns)))
                 total_rows = len(df)
 
             elif ext == ".json":
-                # JSON: attempt to normalize nested structures
                 try:
                     with open(file_path, "r") as f:
                         raw = json.load(f)
                     if isinstance(raw, list):
                         df = pd.json_normalize(raw)
                     elif isinstance(raw, dict):
-                        # Try to find the first list value
                         for key, val in raw.items():
                             if isinstance(val, list):
                                 df = pd.json_normalize(val)
@@ -595,26 +441,23 @@ class RAGEngine:
                     else:
                         return f"❌ Unsupported JSON structure in `{file_name}`."
                 except json.JSONDecodeError as e:
-                    return f"❌ Invalid JSON in `{file_name}`: {str(e)}"
+                    return f"❌ Invalid JSON in `{file_name}`: {e}"
 
                 if len(df) > MAX_DATAFRAME_ROWS:
                     df = df.head(MAX_DATAFRAME_ROWS)
-
                 table_name = self._clean_table_name(file_name)
                 df = self._clean_dataframe(df)
                 self._load_df_to_duckdb(df, table_name)
+                self.table_source_files[table_name] = file_name
                 tables_created.append((table_name, len(df), list(df.columns)))
                 total_rows = len(df)
 
         except Exception as e:
-            return (
-                f"❌ Error reading `{file_name}`: {type(e).__name__}: {str(e)}"
-            )
+            return f"❌ Error reading `{file_name}`: {type(e).__name__}: {e}"
 
         if not tables_created:
             return f"⚠️ No data could be extracted from `{file_name}`."
 
-        # Update metadata
         table_names = [t[0] for t in tables_created]
         self._add_file_metadata(
             file_name, "structured",
@@ -622,7 +465,6 @@ class RAGEngine:
             total_rows=total_rows,
         )
 
-        # Build the response message
         lines = [f"📊 **{file_name}** loaded successfully!\n"]
         lines.append("| Table | Rows | Columns |")
         lines.append("|-------|------|---------|")
@@ -631,60 +473,87 @@ class RAGEngine:
             if len(cols) > 5:
                 col_preview += f", ... (+{len(cols) - 5} more)"
             lines.append(f"| `{tname}` | {nrows:,} | {len(cols)} ({col_preview}) |")
-        lines.append(
-            "\n💡 You can now ask analytical questions about this data!"
-        )
+        lines.append("\n💡 You can now ask analytical questions about this data!")
         return "\n".join(lines)
 
     def _load_df_to_duckdb(self, df: pd.DataFrame, table_name: str):
-        """
-        Load a cleaned DataFrame into DuckDB as a SQL table.
-
-        Uses a transient native duckdb connection for high-perf DataFrame
-        loading, then closes it so the SQLAlchemy engine can reconnect.
-        """
-        # Dispose SQLAlchemy engine temporarily to free the file lock
         if self.sql_engine is not None:
             self.sql_engine.dispose()
             self.sql_engine = None
 
-        # Use transient native duckdb for DataFrame loading (fast, zero-copy)
         conn = duckdb.connect(str(self.duckdb_path))
         try:
             conn.register("_temp_df", df)
-            conn.execute(
-                f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM _temp_df'
-            )
+            conn.execute(f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM _temp_df')
             conn.unregister("_temp_df")
         finally:
             conn.close()
 
-        # Track the table
         if table_name not in self.sql_tables:
             self.sql_tables.append(table_name)
 
-        # Re-establish SQLAlchemy engine and refresh SQLDatabase for LlamaIndex
         self._connect_duckdb()
-
         logger.info(
             f"[{self.thread_id}] Loaded table '{table_name}' "
             f"with {len(df)} rows, {len(df.columns)} cols"
         )
 
     # ══════════════════════════════════════════════════════════════
+    # TABLE CONTEXT (SAMPLE DATA FOR SMARTER SQL)
+    # ══════════════════════════════════════════════════════════════
+
+    def _get_sample_data_context(self) -> str:
+        """Fetch sample rows from each table so the LLM understands the actual data."""
+        if self.sql_engine is None or not self.sql_tables:
+            return ""
+
+        context_parts = []
+        try:
+            with self.sql_engine.connect() as conn:
+                for table in self.sql_tables:
+                    source_file = self.table_source_files.get(table, "uploaded file")
+                    try:
+                        result = conn.execute(text(f"SELECT * FROM {table} LIMIT 3"))
+                        cols = list(result.keys())
+                        rows = result.fetchall()
+                        if rows:
+                            header = " | ".join(cols)
+                            sample_lines = []
+                            for row in rows:
+                                sample_lines.append(" | ".join(str(v) for v in row))
+                            context_parts.append(
+                                f"Table '{table}' (from {source_file}):\n"
+                                f"  Columns: {header}\n"
+                                f"  Sample rows:\n"
+                                + "\n".join(f"    {line}" for line in sample_lines)
+                            )
+                    except Exception as e:
+                        logger.warning(f"[{self.thread_id}] Failed to get sample for {table}: {e}")
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] Failed to get sample data context: {e}")
+
+        return "\n\n".join(context_parts)
+
+    def _get_source_files_description(self) -> str:
+        """Build a user-friendly description of which files the data came from."""
+        files = self.metadata.get("files", [])
+        if not files:
+            return "your uploaded data"
+        file_names = [f["name"] for f in files if f.get("type") == "structured"]
+        if len(file_names) == 1:
+            return f"your uploaded file ({file_names[0]})"
+        elif file_names:
+            return f"your uploaded files ({', '.join(file_names)})"
+        return "your uploaded data"
+
+    # ══════════════════════════════════════════════════════════════
     # QUERY ROUTING
     # ══════════════════════════════════════════════════════════════
 
     def _rebuild_router(self):
-        """
-        Rebuild the RouterQueryEngine whenever a new data source is added.
-
-        Creates QueryEngineTools for each available engine and combines
-        them under an LLM-based router.
-        """
+        """Rebuild the RouterQueryEngine whenever a new data source is added."""
         tools = []
 
-        # Vector search tool
         if self.vector_index is not None:
             self.vector_query_engine = self.vector_index.as_query_engine(
                 similarity_top_k=SIMILARITY_TOP_K,
@@ -703,13 +572,81 @@ class RAGEngine:
                 )
             )
 
-        # SQL tool
         if self.sql_database is not None and self.sql_tables:
             table_info = ", ".join(self.sql_tables)
+            sample_context = self._get_sample_data_context()
+            source_desc = self._get_source_files_description()
+
+            # --- Strict DuckDB Dialect Prompt ---
+            from llama_index.core import PromptTemplate
+
+            sample_section = ""
+            if sample_context:
+                sample_section = (
+                    f"\nSAMPLE DATA (use this to understand column contents):\n"
+                    f"{sample_context}\n"
+                )
+
+            duckdb_prompt = PromptTemplate(
+                "Given an input question, create a syntactically correct DuckDB SQL "
+                "query to run, then return ONLY the SQL query.\n\n"
+                "CRITICAL RULES (violating any will crash the system):\n"
+                "1. NEVER use backticks (`) around table or column names.\n"
+                "2. NEVER use double quotes around table or column names.\n"
+                "3. Write all identifiers as plain lowercase text.\n"
+                "4. End with a semicolon.\n"
+                "5. Output ONLY the SQL query — no explanation, no markdown.\n\n"
+                "SMART QUERY RULES:\n"
+                "6. When the user asks about items by name, ALWAYS select human-readable "
+                "columns (e.g. product_name, brand, category) — NOT just IDs.\n"
+                "7. When listing items, include descriptive columns (name, brand, category, price) "
+                "alongside any counts or aggregations.\n"
+                "8. When counting unique items, report the COUNT, not every single ID.\n"
+                "9. For 'what are the products', select product_name (and optionally brand, category) — "
+                "NEVER just product_id.\n\n"
+                "CORRECT examples:\n"
+                "  SELECT product_name, brand, category FROM product;\n"
+                "  SELECT COUNT(DISTINCT product_id) AS total_unique_products FROM product;\n"
+                "  SELECT brand, COUNT(*) AS product_count FROM product GROUP BY brand "
+                "ORDER BY product_count DESC LIMIT 5;\n"
+                "  SELECT product_name, mrp_inr FROM product ORDER BY mrp_inr DESC LIMIT 10;\n\n"
+                "WRONG examples (will crash or give bad results):\n"
+                "  SELECT * FROM `product`;                    -- backticks crash DuckDB\n"
+                "  SELECT DISTINCT product_id FROM product;    -- IDs are meaningless to users\n\n"
+                "Use only the tables and columns from the schema below.\n"
+                "{schema}\n"
+                + sample_section +
+                "\nQuestion: {query_str}\n"
+                "SQLQuery: "
+            )
+
+            # --- Response synthesis prompt ---
+            response_synthesis_prompt = PromptTemplate(
+                "You are a helpful data analyst assistant. The user uploaded a spreadsheet/data file "
+                "and asked a question. You analyzed their data and got a result.\n\n"
+                "Now compose a clear, friendly, natural language response.\n\n"
+                "ABSOLUTE RULES:\n"
+                "1. Answer the question directly using the data result provided.\n"
+                "2. Include specific numbers, names, and values — be precise.\n"
+                "3. NEVER mention 'database', 'table', 'SQL', 'query', or any technical terms.\n"
+                "4. NEVER say 'run this query', 'execute', or suggest the user do anything technical.\n"
+                "5. NEVER show any SQL code in your response.\n"
+                "6. Refer to the data source as 'your data', 'your spreadsheet', or "
+                f"'{source_desc}' — NEVER as 'database' or 'table'.\n"
+                "7. Use friendly formatting: bullet points, bold numbers, emojis where appropriate.\n"
+                "8. If listing items, show names/descriptions — NEVER raw IDs.\n\n"
+                "Question: {query_str}\n"
+                "SQL Query (internal, DO NOT show this): {sql_query}\n"
+                "Data Result: {context_str}\n\n"
+                "Answer: "
+            )
+
             self.sql_query_engine = NLSQLTableQueryEngine(
                 sql_database=self.sql_database,
                 tables=self.sql_tables,
                 llm=self.llm,
+                text_to_sql_prompt=duckdb_prompt,
+                response_synthesis_prompt=response_synthesis_prompt,
             )
             tools.append(
                 QueryEngineTool.from_defaults(
@@ -725,18 +662,14 @@ class RAGEngine:
                 )
             )
 
-        if len(tools) == 0:
+        if not tools:
             self.router_query_engine = None
             return
 
         if len(tools) == 1:
-            # Only one engine available — use it directly
             self.router_query_engine = tools[0].query_engine
-            logger.info(
-                f"[{self.thread_id}] Single engine active: {tools[0].metadata.name}"
-            )
+            logger.info(f"[{self.thread_id}] Single engine active: {tools[0].metadata.name}")
         else:
-            # Multiple engines — use LLM router
             self.router_query_engine = RouterQueryEngine(
                 selector=LLMSingleSelector.from_defaults(llm=self.llm),
                 query_engine_tools=tools,
@@ -748,23 +681,129 @@ class RAGEngine:
             )
 
     # ══════════════════════════════════════════════════════════════
+    # DIRECT SQL EXECUTION (FALLBACK)
+    # ══════════════════════════════════════════════════════════════
+
+    def _fix_sql_syntax(self, sql: str) -> str:
+        """Fix common LLM SQL mistakes for DuckDB compatibility."""
+        # Remove backticks (MySQL habit)
+        sql = sql.replace("`", "")
+        # Remove markdown code fences
+        sql = re.sub(r"```(?:sql)?\s*", "", sql)
+        sql = sql.strip().rstrip(";")
+        return sql + ";"
+
+    def _extract_sql_from_text(self, text: str) -> str | None:
+        """Try to extract a SQL query from LLM text that contains one."""
+        # Try code block first
+        code_match = re.search(r"```(?:sql)?\s*(.+?)```", text, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            return code_match.group(1).strip()
+
+        # Try to find a SELECT statement
+        select_match = re.search(
+            r"(SELECT\s+.+?;)",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if select_match:
+            return select_match.group(1).strip()
+
+        # Check if the whole text is basically a SQL query
+        stripped = text.strip()
+        if stripped.upper().startswith("SELECT"):
+            return stripped
+
+        return None
+
+    def _execute_sql_directly(self, sql: str) -> str | None:
+        """Execute a SQL query directly against DuckDB and format results."""
+        if self.sql_engine is None:
+            return None
+
+        fixed_sql = self._fix_sql_syntax(sql)
+        logger.info(f"[{self.thread_id}] Direct SQL execution: {fixed_sql[:200]}")
+
+        try:
+            with self.sql_engine.connect() as conn:
+                result = conn.execute(text(fixed_sql))
+                columns = list(result.keys())
+                rows = result.fetchall()
+
+                if not rows:
+                    return "The query ran successfully but returned no results."
+
+                # Single value result (e.g. COUNT, AVG, SUM)
+                if len(columns) == 1 and len(rows) == 1:
+                    value = rows[0][0]
+                    return f"**Result:** {value}"
+
+                # Build a markdown table for multi-row / multi-column results
+                lines = []
+                lines.append("| " + " | ".join(str(c) for c in columns) + " |")
+                lines.append("| " + " | ".join("---" for _ in columns) + " |")
+                for row in rows[:50]:  # Limit to 50 rows
+                    lines.append("| " + " | ".join(str(v) for v in row) + " |")
+                if len(rows) > 50:
+                    lines.append(f"\n*...and {len(rows) - 50} more rows*")
+
+                return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] Direct SQL failed: {e}")
+            return None
+
+    def _looks_like_sql_not_answer(self, text: str) -> bool:
+        """Detect if the LLM returned SQL instead of a natural language answer."""
+        stripped = text.strip().upper()
+
+        # Starts with SQL keywords
+        if stripped.startswith(("SELECT ", "WITH ")):
+            return True
+
+        # Contains a SQL code block
+        if re.search(r"```(?:sql)?\s*SELECT", text, re.IGNORECASE):
+            return True
+
+        # Contains phrases suggesting the user should run SQL themselves
+        suggestion_patterns = [
+            r"(?:run|execute|try)\s+(?:this|the)\s+(?:query|sql)",
+            r"here\s*(?:is|'s)\s+(?:the|a)\s+(?:query|sql)",
+            r"you\s+can\s+(?:run|execute|use)",
+            r"the\s+(?:correct|valid|proper)\s+(?:query|sql)",
+        ]
+        for pattern in suggestion_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+
+        return False
+
+    def _sanitize_answer(self, answer: str) -> str:
+        """Post-process: replace technical jargon with user-friendly language."""
+        source_desc = self._get_source_files_description()
+
+        # Replace "database" references
+        replacements = [
+            (r'\b[Tt]he database\b', 'your data'),
+            (r'\b[Ii]n the database\b', f'in {source_desc}'),
+            (r'\b[Ff]rom the database\b', f'from {source_desc}'),
+            (r'\b[Oo]ur database\b', 'your data'),
+            (r'\b[Tt]he table\b', 'your data'),
+            (r'\b[Ii]n the table\b', f'in {source_desc}'),
+            (r'\b[Ff]rom the table\b', f'from {source_desc}'),
+            (r'\baccording to the database\b', f'based on {source_desc}'),
+            (r'\bAccording to the database\b', f'Based on {source_desc}'),
+        ]
+        for pattern, replacement in replacements:
+            answer = re.sub(pattern, replacement, answer)
+
+        return answer
+
+    # ══════════════════════════════════════════════════════════════
     # QUERYING — PUBLIC API
     # ══════════════════════════════════════════════════════════════
 
     async def query(self, question: str, chat_history: list[dict] | None = None) -> str:
-        """
-        Query the RAG system.
-
-        Routes the question through the RouterQueryEngine which selects
-        the appropriate backend (vector search or SQL).
-
-        Args:
-            question: The user's natural language question.
-            chat_history: Optional conversation history for context.
-
-        Returns:
-            The synthesized answer string.
-        """
         if self.router_query_engine is None:
             return (
                 "⚠️ No data has been loaded yet. "
@@ -775,31 +814,76 @@ class RAGEngine:
 
         try:
             response = await self.router_query_engine.aquery(question)
-            answer = str(response)
+            answer   = str(response).strip()
 
-            logger.info(
-                f"[{self.thread_id}] Query answered "
-                f"({len(answer)} chars)"
-            )
+            # --- Check metadata for SQL results first ---
+            if response.metadata and "result" in response.metadata:
+                sql_query   = str(response.metadata.get("sql_query", "")).strip()
+                result_data = response.metadata.get("result", [])
+
+                # If the answer looks like SQL rather than a natural language answer
+                if self._looks_like_sql_not_answer(answer):
+                    logger.warning(
+                        f"[{self.thread_id}] LLM returned SQL instead of answer, "
+                        f"using metadata result directly"
+                    )
+                    if result_data:
+                        # Try to format nicely
+                        if isinstance(result_data, list) and len(result_data) == 1:
+                            # Single row — extract the value
+                            row = result_data[0]
+                            if isinstance(row, (tuple, list)) and len(row) == 1:
+                                answer = f"Based on your data, the answer is: **{row[0]}**"
+                            else:
+                                answer = f"**Result:** {row}"
+                        else:
+                            answer = f"**Results from your data:**\n```\n{result_data}\n```"
+                    else:
+                        answer = "The query ran successfully but returned no matching data."
+
+            # --- Broader fallback: answer still looks like SQL ---
+            if self._looks_like_sql_not_answer(answer):
+                logger.warning(
+                    f"[{self.thread_id}] Answer still looks like SQL, "
+                    f"attempting direct execution"
+                )
+                extracted_sql = self._extract_sql_from_text(answer)
+                if extracted_sql and self.sql_tables:
+                    direct_result = self._execute_sql_directly(extracted_sql)
+                    if direct_result:
+                        answer = f"📊 {direct_result}"
+
+            # --- Post-process: clean technical jargon from the answer ---
+            answer = self._sanitize_answer(answer)
+
+            logger.info(f"[{self.thread_id}] Query answered ({len(answer)} chars)")
             return answer
-
         except Exception as e:
-            error_msg = f"❌ Query failed: {type(e).__name__}: {str(e)}"
-            logger.error(f"[{self.thread_id}] {error_msg}", exc_info=True)
-            return error_msg
+            # --- Last resort: try to generate and execute SQL directly ---
+            error_str = str(e)
+            logger.error(f"[{self.thread_id}] Query engine failed: {error_str}", exc_info=True)
+
+            # If DuckDB syntax error, try fixing and re-executing
+            if self.sql_tables and ("syntax error" in error_str.lower() or "Parser Error" in error_str):
+                extracted = self._extract_sql_from_text(error_str)
+                if extracted:
+                    direct_result = self._execute_sql_directly(extracted)
+                    if direct_result:
+                        return f"📊 {direct_result}"
+
+            return (
+                "❌ I encountered an error while querying your data. "
+                "Please try rephrasing your question."
+            )
 
     # ══════════════════════════════════════════════════════════════
     # STATE INSPECTION — PUBLIC API
     # ══════════════════════════════════════════════════════════════
 
     def has_data(self) -> bool:
-        """Check if any files have been ingested in this session."""
-        has_vectors = self.vector_index is not None
-        has_tables = len(self.sql_tables) > 0
-        return has_vectors or has_tables
+        return self.vector_index is not None or len(self.sql_tables) > 0
 
     def get_loaded_files_summary(self) -> str:
-        """Return a human-readable summary of all loaded files and tables."""
         files = self.metadata.get("files", [])
         if not files:
             return "No files loaded."
@@ -824,39 +908,23 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     @classmethod
-    def load_from_storage(cls, thread_id: str, llm, embed_model=None) -> Optional["RAGEngine"]:
+    def load_from_storage(cls, thread_id: str, embed_model=None) -> Optional["RAGEngine"]:
         """
         Attempt to restore a RAGEngine from persisted storage.
 
-        Used during chat resume to reconnect to previously uploaded data.
-
-        Args:
-            thread_id: The chat thread ID to restore.
-            llm: LlamaIndex LLM instance.
-            embed_model: Optional embedding model override.
-
-        Returns:
-            A restored RAGEngine instance, or None if no storage exists.
+        No llm argument needed — LLM is resolved from Settings.llm.
         """
-        storage_dir = Path(RAG_STORAGE_DIR) / thread_id
+        chroma_dir  = CHROMA_DB_DIR / thread_id
+        duckdb_path = DUCKDB_DIR / thread_id / "structured.duckdb"
 
-        if not storage_dir.exists():
+        has_vectors = chroma_dir.exists()
+        has_duckdb  = duckdb_path.exists()
+
+        if not has_vectors and not has_duckdb:
             logger.info(f"[{thread_id}] No RAG storage found for resume")
             return None
 
-        # Check if there's actually any data
-        chroma_dir = storage_dir / "chroma_db"
-        duckdb_path = storage_dir / "structured.duckdb"
-
-        has_vectors = chroma_dir.exists()
-        has_duckdb = duckdb_path.exists()
-
-        if not has_vectors and not has_duckdb:
-            logger.info(f"[{thread_id}] Storage dir exists but no data found")
-            return None
-
-        # The constructor handles reconnection automatically
-        engine = cls(thread_id=thread_id, llm=llm, embed_model=embed_model)
+        engine = cls(thread_id=thread_id, embed_model=embed_model)
 
         if engine.has_data():
             logger.info(
@@ -864,22 +932,22 @@ class RAGEngine:
                 f"(vectors={has_vectors}, tables={engine.sql_tables})"
             )
             return engine
-        else:
-            logger.info(f"[{thread_id}] Storage exists but no queryable data")
-            return None
+
+        logger.info(f"[{thread_id}] Storage exists but no queryable data")
+        return None
 
     # ══════════════════════════════════════════════════════════════
     # CLEANUP
     # ══════════════════════════════════════════════════════════════
 
     def close(self):
-        """Clean up all connections (SQLAlchemy engine, DuckDB, ChromaDB)."""
+        """Clean up all connections."""
         if self.sql_engine is not None:
             try:
                 self.sql_engine.dispose()
             except Exception:
                 pass
             self.sql_engine = None
-        self.sql_database = None
+        self.sql_database        = None
         self.router_query_engine = None
         logger.info(f"[{self.thread_id}] RAGEngine closed")

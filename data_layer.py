@@ -23,12 +23,12 @@ from chainlit.types import (
 from chainlit.user import PersistedUser, User
 from chainlit.step import StepDict
 from chainlit.element import Element, ElementDict
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
-DB_PATH = "chainlit_data.db"
-
+DB_PATH = str(Path(__file__).parent / "storage" / "chainlit" / "chainlit_data.db")
 
 class SQLiteDataLayer(BaseDataLayer):
     """Custom Chainlit data layer backed by SQLite with bcrypt user auth."""
@@ -648,20 +648,27 @@ class SQLiteDataLayer(BaseDataLayer):
             self._db = None
 
 
-async def seed_default_users(data_layer: SQLiteDataLayer):
-    """Seed default users if they don't exist."""
-    default_users = [
-        ("admin@genius.ai", "admin", "ADMIN"),
-        ("harnish@genius.ai", "Pass@1234", "USER"),
-        ("hrishikesh@genius.ai", "Pass@1234", "USER"),
-        ("sarvesh@genius.ai", "Pass@1234", "USER"),
-        ("aniket@genius.ai", "Pass@1234", "USER"),
-        ("avnish@genius.ai", "Pass@1234", "USER"),
-    ]
+from config import INITIAL_USERS
 
-    for identifier, password, role in default_users:
+async def seed_default_users(data_layer: SQLiteDataLayer):
+    """Seed default users if they don't exist, or update their passwords if they do."""
+    db = await data_layer._get_db()
+    for identifier, password, role in INITIAL_USERS:
         try:
-            await data_layer.register_user(identifier, password, role)
-            logger.info(f"Seeded user: {identifier}")
-        except ValueError:
-            pass  # User already exists
+            # We use a manual insert with ON CONFLICT to ensure even existing users 
+            # have their passwords updated to the latest 'seed' password.
+            password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+            user_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc).strftime(ISO_FORMAT)
+            metadata = json.dumps({"role": role})
+
+            await db.execute(
+                """INSERT INTO users (id, identifier, display_name, password_hash, role, metadata, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(identifier) DO UPDATE SET password_hash=excluded.password_hash""",
+                (user_id, identifier, identifier, password_hash, role, metadata, now),
+            )
+            await db.commit()
+            logger.info(f"Seeded/Updated user: {identifier}")
+        except Exception as e:
+            logger.error(f"Failed to seed user {identifier}: {e}")
