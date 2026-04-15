@@ -1,5 +1,5 @@
 [project]
-name = "sturdy-octo-fortnight"
+name = "genius-ai"
 version = "0.1.0"
 description = "Genius AI - Production Chainlit Chat Interface"
 requires-python = ">=3.12"
