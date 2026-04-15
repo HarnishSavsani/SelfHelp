@@ -17,5 +17,10 @@ dependencies = [
     "pandas>=2.0.0",
     "openpyxl>=3.1.0",
     "sqlalchemy>=2.0.0",
-    "pyarrow>=15.0.0"
+    "pyarrow>=15.0.0",
+    "chromadb>=1.0.0",
+    "llama-index-vector-stores-chroma>=0.4.0",
+    "duckdb>=1.0.0",
+    "duckdb-engine>=0.15.0",
+    "sentence-transformers>=3.0.0",
 ]

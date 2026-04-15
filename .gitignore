@@ -177,3 +177,6 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 chainlit_data.db-*
+
+# RAG storage (per-session data)
+rag_storage/

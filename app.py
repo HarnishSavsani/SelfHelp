@@ -5,6 +5,7 @@ from fastapi import Request, Response
 
 import asyncio
 import logging
+import os
 from dotenv import load_dotenv, find_dotenv
 from typing import Optional, List
 
@@ -13,6 +14,7 @@ from llama_index.core.base.llms.types import ChatMessage, MessageRole
 from groq import AsyncGroq
 
 from data_layer import SQLiteDataLayer, seed_default_users
+from rag_engine import RAGEngine
 
 ### Global settings
 logger = logging.getLogger(__name__)
@@ -125,10 +127,52 @@ async def setup_agent(settings):
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    """On message handler."""
+    """On message handler — handles file uploads and RAG/direct queries."""
     user = cl.user_session.get("user")
     logger.info(f"Received message: '{message.content}' from {user.identifier}")
-    await generate_answer(message.content)
+
+    llm = cl.user_session.get("llm")
+    thread_id = cl.context.session.thread_id
+
+    # ── Handle file uploads ─────────────────────────────────────
+    if message.elements:
+        # Get or create RAG engine for this session
+        rag_engine: RAGEngine = cl.user_session.get("rag_engine")
+        if rag_engine is None:
+            rag_engine = RAGEngine(thread_id=thread_id, llm=llm)
+            cl.user_session.set("rag_engine", rag_engine)
+
+        # Process each uploaded file
+        results = []
+        for element in message.elements:
+            if hasattr(element, "path") and element.path:
+                file_name = element.name or os.path.basename(element.path)
+                logger.info(f"Processing uploaded file: {file_name}")
+
+                processing_msg = cl.Message(
+                    content=f"⏳ Processing **{file_name}**...",
+                    type="assistant_message",
+                )
+                await processing_msg.send()
+
+                result = await rag_engine.ingest_file(element.path, file_name)
+                results.append(result)
+
+                # Update the processing message with the result
+                processing_msg.content = result
+                await processing_msg.update()
+
+        # If user also included a text question with files, answer it
+        if message.content.strip():
+            await generate_rag_answer(message.content)
+        return
+
+    # ── Handle queries (RAG or direct) ──────────────────────────
+    rag_engine: RAGEngine = cl.user_session.get("rag_engine")
+    if rag_engine and rag_engine.has_data():
+        await generate_rag_answer(message.content)
+    else:
+        await generate_answer(message.content)
 
 
 # ── Lifecycle Handlers ────────────────────────────────────────────
@@ -144,6 +188,11 @@ async def on_stop():
 def on_chat_end():
     user = cl.user_session.get("user")
     logger.info(f"{user.identifier} ended the chat")
+    # Clean up RAG engine connections
+    rag_engine: RAGEngine = cl.user_session.get("rag_engine")
+    if rag_engine:
+        rag_engine.close()
+        cl.user_session.set("rag_engine", None)
 
 
 @cl.on_logout
@@ -155,7 +204,7 @@ def on_logout(request: Request, response: Response):
 
 @cl.on_chat_resume
 async def on_chat_resume(thread: ThreadDict):
-    """Resume a chat — restore messages."""
+    """Resume a chat — restore messages and RAG engine."""
     groq_llm = Groq(model="llama-3.3-70b-versatile", temperature=0, max_retries=10)
 
     # ── Restore conversation history ────────────────────────────
@@ -175,15 +224,30 @@ async def on_chat_resume(thread: ThreadDict):
         summary = await _summarize_messages(groq_llm, chat_messages[:-MAX_RECENT_MESSAGES])
         cl.user_session.set("conversation_summary", summary)
 
+    # ── Restore RAG engine if data exists ───────────────────────
+    thread_id = thread.get("id", "")
+    rag_engine = RAGEngine.load_from_storage(thread_id, groq_llm)
+    if rag_engine:
+        cl.user_session.set("rag_engine", rag_engine)
+        files_summary = rag_engine.get_loaded_files_summary()
+        logger.info(f"RAG engine restored for thread {thread_id}")
+    else:
+        cl.user_session.set("rag_engine", None)
+        files_summary = None
+
     user = cl.user_session.get("user")
     logger.info(f"{user} resumed chat")
 
-    await cl.Message(
-        content=(
-            "👋 **Welcome back!** Your conversation history has been restored.\n"
-            "Feel free to continue chatting!"
+    welcome_content = (
+        "👋 **Welcome back!** Your conversation history has been restored.\n"
+    )
+    if files_summary:
+        welcome_content += (
+            f"\n📎 **Your uploaded data is ready to query:**\n{files_summary}\n"
         )
-    ).send()
+    welcome_content += "\nFeel free to continue chatting!"
+
+    await cl.Message(content=welcome_content).send()
 
 
 # ── Context Engineering ───────────────────────────────────────────
@@ -259,6 +323,35 @@ async def generate_answer(query: str):
     await msg.send()
 
     chat_messages.append({"role": "assistant", "content": response_str})
+    cl.user_session.set("chat_messages", chat_messages)
+
+    return msg
+
+
+async def generate_rag_answer(query: str):
+    """Generate a response using the RAG engine (structured/unstructured)."""
+    rag_engine: RAGEngine = cl.user_session.get("rag_engine")
+    chat_messages: List[dict] = cl.user_session.get("chat_messages", [])
+
+    msg = cl.Message("", type="assistant_message")
+
+    chat_messages.append({"role": "user", "content": query})
+
+    try:
+        # Query through the RAG router
+        answer = await rag_engine.query(query, chat_messages)
+        msg.content = answer
+        await msg.send()
+    except Exception as e:
+        logger.error(f"RAG query failed: {e}", exc_info=True)
+        msg.content = (
+            "❌ An error occurred while processing your query. "
+            "Please try rephrasing your question."
+        )
+        await msg.send()
+        answer = msg.content
+
+    chat_messages.append({"role": "assistant", "content": answer})
     cl.user_session.set("chat_messages", chat_messages)
 
     return msg
