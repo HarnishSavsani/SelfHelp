@@ -1,0 +1,13 @@
+{
+  "thread_id": "1bd599b6-7c20-4242-88bf-39e5ebb729a5",
+  "files": [
+    {
+      "name": "CDLI Proposal.pdf",
+      "type": "unstructured",
+      "ingested_at": "2026-04-15T19:26:53.395014+00:00",
+      "chunks": 48
+    }
+  ],
+  "vector_index_exists": true,
+  "sql_tables": []
+}
