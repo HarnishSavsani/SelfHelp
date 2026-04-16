@@ -5,37 +5,80 @@ Centralizes all model instantiation so no other file needs to
 know which provider is active. Call setup_global_llm() once at
 chat-start; LlamaIndex Settings picks it up everywhere else.
 
-Supported providers (ACTIVE_LLM_PROVIDER in config.py / .env):
+Supported LLM providers (ACTIVE_LLM_PROVIDER in config.py / .env):
   - "ollama"        → local Ollama server (default: qwen2.5:3b)
   - "azure_custom"  → Azure-hosted custom endpoint via LangChain wrapper
+
+Supported Embedding providers (ACTIVE_EMBEDDING_PROVIDER):
+  - "huggingface"   → local HuggingFace model (default: BAAI/bge-small-en-v1.5)
+  - "azure_custom"  → Azure-hosted embedding via LangChain wrapper
 """
 
 import logging
 
 from llama_index.core import Settings
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from config import (
     ACTIVE_LLM_PROVIDER,
+    ACTIVE_EMBEDDING_PROVIDER,
     AZURE_CUSTOM_CONFIG,
+    AZURE_EMBEDDING_CONFIG,
     OLLAMA_CONFIG,
     EMBED_MODEL_NAME,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── Embedding (shared across providers) ──────────────────────────
-_embed_model: HuggingFaceEmbedding | None = None
+# ── Embedding (cached singleton) ─────────────────────────────────
+_embed_model = None
 
 
-def get_embed_model() -> HuggingFaceEmbedding:
-    """Return (and cache) the HuggingFace embedding model."""
+def get_embed_model():
+    """Return (and cache) the embedding model based on ACTIVE_EMBEDDING_PROVIDER."""
     global _embed_model
-    if _embed_model is None:
-        logger.info(f"Loading embedding model: {EMBED_MODEL_NAME}")
-        _embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL_NAME)
-        Settings.embed_model = _embed_model
+    if _embed_model is not None:
+        return _embed_model
+
+    if ACTIVE_EMBEDDING_PROVIDER == "azure_custom":
+        _embed_model = _build_azure_embedding()
+    else:
+        _embed_model = _build_huggingface_embedding()
+
+    Settings.embed_model = _embed_model
     return _embed_model
+
+
+def _build_huggingface_embedding():
+    """Build a local HuggingFace embedding model."""
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+    logger.info(f"Loading HuggingFace embedding model: {EMBED_MODEL_NAME}")
+    return HuggingFaceEmbedding(model_name=EMBED_MODEL_NAME)
+
+
+def _build_azure_embedding():
+    """
+    Build an Azure-hosted custom embedding model wrapped for LlamaIndex.
+    Uses LangChain's OpenAIEmbeddings + LlamaIndex's LangchainEmbedding adapter.
+    SSL verification is disabled for the TCS internal endpoint.
+    """
+    import httpx
+    from langchain_openai import OpenAIEmbeddings
+    from llama_index.embeddings.langchain import LangchainEmbedding
+
+    logger.info(
+        f"Loading Azure embedding model: {AZURE_EMBEDDING_CONFIG['model']} "
+        f"at {AZURE_EMBEDDING_CONFIG['base_url']}"
+    )
+
+    client = httpx.Client(verify=False)
+    lc_embed = OpenAIEmbeddings(
+        base_url=AZURE_EMBEDDING_CONFIG["base_url"],
+        model=AZURE_EMBEDDING_CONFIG["model"],
+        api_key=AZURE_EMBEDDING_CONFIG["api_key"],
+        http_client=client,
+    )
+    return LangchainEmbedding(lc_embed)
 
 
 # ── LLM factory ───────────────────────────────────────────────────
@@ -77,7 +120,7 @@ def setup_global_llm():
     return llm
 
 
-# ── Private builders ──────────────────────────────────────────────
+# ── Private LLM builders ─────────────────────────────────────────
 
 def _build_ollama_llm():
     """Build a local Ollama LLM (no API key required)."""

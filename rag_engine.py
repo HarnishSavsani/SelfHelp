@@ -2,7 +2,7 @@
 rag_engine.py — Genius AI RAG Engine
 
 Single-file RAG abstraction managing two pipelines:
-  1. Unstructured (PDF/MD/TXT) → ChromaDB vector search
+  1. Unstructured (PDF/MD/TXT) → ChromaDB vector search (+ BM25 hybrid)
   2. Structured (Excel/CSV/JSON) → DuckDB SQL engine
 
 Design Principles:
@@ -12,6 +12,12 @@ Design Principles:
   - LLM is resolved from LlamaIndex Settings (set by llm_factory)
   - Zero dependency on Chainlit internals (clean separation)
   - Incremental ingestion — files can be added mid-conversation
+
+Advanced Features:
+  - Docling PDF parsing (tables, code, figures, OCR)
+  - Hybrid retrieval (BM25 keyword + vector semantic)
+  - Contextual query rewriting using chat history
+  - Source citations in responses
 """
 
 import json
@@ -31,9 +37,11 @@ from llama_index.core import (
     Settings,
     StorageContext,
     VectorStoreIndex,
+    PromptTemplate,
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.readers import SimpleDirectoryReader
+from llama_index.core.schema import Document, TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from llama_index.core import SQLDatabase
@@ -54,10 +62,39 @@ from config import (
     MAX_DATAFRAME_ROWS,
     UNSTRUCTURED_EXTENSIONS,
     STRUCTURED_EXTENSIONS,
+    ENABLE_HYBRID_SEARCH,
 )
 from app_profile import profile
 
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════
+# DOCUMENT RESPONSE SYNTHESIS PROMPT
+# ══════════════════════════════════════════════════════════════════
+
+DOCUMENT_QA_PROMPT = PromptTemplate(
+    "You are a meticulous document analyst. Answer the question using ONLY the "
+    "context provided below. Follow these rules strictly:\n\n"
+    "RULES:\n"
+    "1. Answer ONLY from the provided context. If the context does not contain "
+    "enough information, say 'Based on the available document content, I don't "
+    "have enough information to fully answer this question.'\n"
+    "2. ALWAYS cite your sources. Use format: (Source: filename, page X) when "
+    "page numbers are available.\n"
+    "3. When the context contains tables, reproduce them as formatted markdown tables.\n"
+    "4. When the context contains code, reproduce it in proper code blocks.\n"
+    "5. When listing key metrics or data points, use bullet points with bold values.\n"
+    "6. Be precise — include specific numbers, percentages, names, and dates.\n"
+    "7. Use emojis sparingly to improve readability.\n"
+    "8. Structure your answer with headers if the response is long.\n\n"
+    "-----\n"
+    "CONTEXT:\n"
+    "{context_str}\n"
+    "-----\n\n"
+    "Question: {query_str}\n\n"
+    "Detailed Answer: "
+)
 
 
 class RAGEngine:
@@ -132,6 +169,9 @@ class RAGEngine:
         self.vector_query_engine  = None
         self.sql_query_engine     = None
         self.router_query_engine: Optional[RouterQueryEngine] = None
+
+        # ── BM25 for hybrid retrieval ─────────────────────────────
+        self._all_nodes: list[TextNode] = []  # Stored for BM25 re-ranking
 
         # ── File tracking ─────────────────────────────────────────
         self.metadata = self._load_metadata()
@@ -229,6 +269,7 @@ class RAGEngine:
         chunks: int = 0,
         tables: list[str] | None = None,
         total_rows: int = 0,
+        content_types: list[str] | None = None,
     ):
         entry: dict = {
             "name": file_name,
@@ -237,6 +278,8 @@ class RAGEngine:
         }
         if file_type == "unstructured":
             entry["chunks"] = chunks
+            if content_types:
+                entry["content_types"] = content_types
         elif file_type == "structured":
             entry["tables"] = tables or []
             entry["total_rows"] = total_rows
@@ -347,6 +390,15 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     async def _ingest_unstructured(self, file_path: str, file_name: str) -> str:
+        ext = Path(file_name).suffix.lower()
+
+        if ext == ".pdf":
+            return await self._ingest_pdf_advanced(file_path, file_name)
+        else:
+            return await self._ingest_text_file(file_path, file_name)
+
+    async def _ingest_text_file(self, file_path: str, file_name: str) -> str:
+        """Ingest plain text / markdown files using SentenceSplitter."""
         reader    = SimpleDirectoryReader(input_files=[file_path])
         documents = reader.load_data()
 
@@ -364,6 +416,158 @@ class RAGEngine:
         nodes    = splitter.get_nodes_from_documents(documents)
         logger.info(f"[{self.thread_id}] Created {len(nodes)} chunks from {file_name}")
 
+        self._index_nodes(nodes)
+        self._add_file_metadata(file_name, "unstructured", chunks=len(nodes))
+
+        return (
+            f"📄 **{file_name}** processed successfully!\n\n"
+            f"- **{len(nodes)}** document chunks indexed for semantic search\n"
+            f"- You can now ask questions about this document's content."
+        )
+
+    async def _ingest_pdf_advanced(self, file_path: str, file_name: str) -> str:
+        """
+        Ingest PDF files using IBM Docling for advanced extraction.
+
+        Docling provides:
+          - Layout analysis (DocLayNet AI model)
+          - Table extraction (TableFormer)
+          - Figure/chart detection
+          - OCR for scanned pages
+
+        Chunking uses MarkdownNodeParser which splits by markdown headers
+        (##, ###) keeping tables, code blocks, and lists intact within
+        their sections — unlike SentenceSplitter which cuts at arbitrary
+        character boundaries and destroys table structure.
+        """
+        try:
+            from llama_index.readers.docling import DoclingReader
+            from llama_index.core.node_parser import MarkdownNodeParser
+
+            logger.info(f"[{self.thread_id}] Using Docling for advanced PDF parsing: {file_name}")
+
+            # Step 1: Parse with DoclingReader (outputs structured Markdown)
+            # Docling converts tables to proper Markdown tables, preserves
+            # code blocks, identifies figures, and handles multi-column layouts.
+            reader = DoclingReader()
+            documents = reader.load_data(file_path=file_path)
+
+            if not documents:
+                logger.warning(f"[{self.thread_id}] Docling returned no documents, falling back to simple reader")
+                return await self._ingest_text_file(file_path, file_name)
+
+            # Step 2: Enrich metadata
+            for doc in documents:
+                doc.metadata.update({
+                    "source_filename": file_name,
+                    "upload_time":     datetime.now(timezone.utc).isoformat(),
+                    "thread_id":       self.thread_id,
+                    "parser":          "docling",
+                })
+
+            # Log the Markdown output size for debugging
+            total_chars = sum(len(doc.get_content()) for doc in documents)
+            logger.info(
+                f"[{self.thread_id}] Docling extracted {total_chars} chars "
+                f"of Markdown from {file_name}"
+            )
+
+            # Step 3: Structure-aware chunking with MarkdownNodeParser
+            # This splits by markdown headers (##, ###), keeping tables,
+            # code blocks, and lists intact within their sections.
+            # This is critical — SentenceSplitter would cut tables in half.
+            try:
+                md_parser = MarkdownNodeParser()
+                nodes = md_parser.get_nodes_from_documents(documents)
+
+                if not nodes:
+                    raise ValueError("MarkdownNodeParser returned 0 nodes")
+
+                # For very large sections (>2000 chars), further split with
+                # SentenceSplitter using a larger chunk size to preserve context
+                final_nodes = []
+                oversized_splitter = SentenceSplitter(
+                    chunk_size=1500, chunk_overlap=200
+                )
+                for node in nodes:
+                    content_len = len(node.get_content())
+                    if content_len > 2000:
+                        # Re-split oversized sections but with generous limits
+                        sub_doc = Document(
+                            text=node.get_content(),
+                            metadata=node.metadata.copy(),
+                        )
+                        sub_nodes = oversized_splitter.get_nodes_from_documents([sub_doc])
+                        final_nodes.extend(sub_nodes)
+                        logger.debug(
+                            f"[{self.thread_id}] Split oversized section "
+                            f"({content_len} chars) into {len(sub_nodes)} sub-chunks"
+                        )
+                    else:
+                        final_nodes.append(node)
+
+                nodes = final_nodes
+
+                logger.info(
+                    f"[{self.thread_id}] MarkdownNodeParser: {file_name} → "
+                    f"{len(nodes)} structure-aware chunks"
+                )
+            except Exception as parser_err:
+                logger.warning(
+                    f"[{self.thread_id}] MarkdownNodeParser failed ({parser_err}), "
+                    f"using SentenceSplitter fallback"
+                )
+                splitter = SentenceSplitter(
+                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+                )
+                nodes = splitter.get_nodes_from_documents(documents)
+
+            # Step 4: Classify content types found in chunks
+            content_types = set()
+            for node in nodes:
+                text_lower = node.get_content().lower()
+                if "|" in text_lower and "---" in text_lower:
+                    content_types.add("tables")
+                if "```" in text_lower:
+                    content_types.add("code")
+                if "figure" in text_lower or "image" in text_lower:
+                    content_types.add("figures")
+                content_types.add("text")
+
+            # Step 5: Index nodes into ChromaDB + BM25
+            self._index_nodes(nodes)
+            self._add_file_metadata(
+                file_name, "unstructured",
+                chunks=len(nodes),
+                content_types=list(content_types),
+            )
+
+            # Build a rich summary
+            type_summary = ", ".join(sorted(content_types))
+            return (
+                f"📄 **{file_name}** processed with advanced parsing!\n\n"
+                f"- 🔬 **Parser**: Docling (layout analysis + table extraction)\n"
+                f"- 📦 **{len(nodes)}** structure-aware chunks indexed\n"
+                f"- 📋 **Content detected**: {type_summary}\n"
+                f"- You can now ask questions about tables, text, and data in this document."
+            )
+
+        except ImportError as e:
+            logger.warning(
+                f"[{self.thread_id}] Docling not available ({e}), "
+                f"falling back to simple reader"
+            )
+            return await self._ingest_text_file(file_path, file_name)
+
+        except Exception as e:
+            logger.warning(
+                f"[{self.thread_id}] Docling parsing failed for {file_name}: {e}. "
+                f"Falling back to simple reader."
+            )
+            return await self._ingest_text_file(file_path, file_name)
+
+    def _index_nodes(self, nodes: list):
+        """Index nodes into ChromaDB vector store and store for BM25."""
         storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
 
         if self.vector_index is None:
@@ -375,13 +579,8 @@ class RAGEngine:
         else:
             self.vector_index.insert_nodes(nodes)
 
-        self._add_file_metadata(file_name, "unstructured", chunks=len(nodes))
-
-        return (
-            f"📄 **{file_name}** processed successfully!\n\n"
-            f"- **{len(nodes)}** document chunks indexed for semantic search\n"
-            f"- You can now ask questions about this document's content."
-        )
+        # Store nodes for BM25 hybrid retrieval
+        self._all_nodes.extend(nodes)
 
     # ══════════════════════════════════════════════════════════════
     # STRUCTURED INGESTION (Excel, CSV, JSON → DuckDB)
@@ -548,6 +747,102 @@ class RAGEngine:
         return "your uploaded data"
 
     # ══════════════════════════════════════════════════════════════
+    # HYBRID RETRIEVAL (BM25 + VECTOR)
+    # ══════════════════════════════════════════════════════════════
+
+    def _bm25_retrieve(self, query: str, top_k: int = 5) -> list[TextNode]:
+        """Keyword-based retrieval using BM25 — complementary to vector search."""
+        if not self._all_nodes:
+            return []
+
+        try:
+            from rank_bm25 import BM25Okapi
+
+            # Tokenize stored node texts
+            corpus = [node.get_content().lower().split() for node in self._all_nodes]
+            bm25 = BM25Okapi(corpus)
+
+            # Score the query
+            query_tokens = query.lower().split()
+            scores = bm25.get_scores(query_tokens)
+
+            # Get top-k nodes by BM25 score
+            top_indices = sorted(
+                range(len(scores)),
+                key=lambda i: scores[i],
+                reverse=True,
+            )[:top_k]
+
+            results = [self._all_nodes[i] for i in top_indices if scores[i] > 0]
+            logger.info(
+                f"[{self.thread_id}] BM25 retrieved {len(results)} nodes "
+                f"(top score: {max(scores):.3f})"
+            )
+            return results
+
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] BM25 retrieval failed: {e}")
+            return []
+
+    # ══════════════════════════════════════════════════════════════
+    # CONTEXTUAL QUERY REWRITING
+    # ══════════════════════════════════════════════════════════════
+
+    def _rewrite_query(self, question: str, chat_history: list[dict] | None) -> str:
+        """
+        Rewrite ambiguous queries using chat history for better retrieval.
+
+        Example: "What about tables?" → "What tables are in the uploaded document?"
+        """
+        if not chat_history or len(chat_history) < 2:
+            return question
+
+        # Only rewrite if the question seems ambiguous (short or uses pronouns)
+        ambiguous_patterns = [
+            r"^(what|how|tell|show|explain)\s+(about|me)\s",
+            r"\b(it|this|that|those|these|them)\b",
+            r"^(and|also|more|again)\s",
+        ]
+        is_ambiguous = len(question.split()) < 6 or any(
+            re.search(p, question, re.IGNORECASE) for p in ambiguous_patterns
+        )
+
+        if not is_ambiguous:
+            return question
+
+        # Build condensed chat context (last 3 exchanges)
+        recent = chat_history[-6:]
+        context_lines = []
+        for msg in recent:
+            role = "User" if msg.get("role") == "user" else "Assistant"
+            content = msg.get("content", "")[:200]
+            context_lines.append(f"{role}: {content}")
+
+        try:
+            rewrite_prompt = (
+                "Given the conversation history and a follow-up question, "
+                "rewrite the question to be self-contained and specific. "
+                "If the question is already clear, return it as-is.\n\n"
+                "Conversation:\n" + "\n".join(context_lines) + "\n\n"
+                f"Follow-up question: {question}\n\n"
+                "Rewritten question: "
+            )
+            response = self.llm.complete(rewrite_prompt)
+            rewritten = str(response).strip()
+
+            # Sanity check — don't use if it's too different or too long
+            if rewritten and len(rewritten) < len(question) * 4:
+                logger.info(
+                    f"[{self.thread_id}] Query rewritten: "
+                    f"'{question}' → '{rewritten}'"
+                )
+                return rewritten
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] Query rewriting failed: {e}")
+
+        return question
+
+    # ══════════════════════════════════════════════════════════════
     # QUERY ROUTING
     # ══════════════════════════════════════════════════════════════
 
@@ -559,6 +854,7 @@ class RAGEngine:
             self.vector_query_engine = self.vector_index.as_query_engine(
                 similarity_top_k=SIMILARITY_TOP_K,
                 llm=self.llm,
+                text_qa_template=DOCUMENT_QA_PROMPT,
             )
             tools.append(
                 QueryEngineTool.from_defaults(
@@ -568,7 +864,8 @@ class RAGEngine:
                         "Useful for searching through uploaded documents "
                         "(PDFs, text files, markdown). Use this when the user "
                         "asks questions about document content, policies, "
-                        "reports, or any unstructured text."
+                        "reports, tables in documents, code snippets, "
+                        "figures, charts, or any unstructured text."
                     ),
                 )
             )
@@ -579,8 +876,6 @@ class RAGEngine:
             source_desc = self._get_source_files_description()
 
             # --- Strict DuckDB Dialect Prompt ---
-            from llama_index.core import PromptTemplate
-
             sample_section = ""
             if sample_context:
                 sample_section = (
@@ -803,6 +1098,36 @@ class RAGEngine:
         return answer
 
     # ══════════════════════════════════════════════════════════════
+    # SOURCE CITATION EXTRACTION
+    # ══════════════════════════════════════════════════════════════
+
+    def _extract_source_citations(self, response) -> str:
+        """Extract source citations from query response metadata."""
+        citations = []
+        try:
+            if hasattr(response, 'source_nodes'):
+                seen = set()
+                for node in response.source_nodes:
+                    meta = node.node.metadata if hasattr(node, 'node') else {}
+                    filename = meta.get('source_filename', meta.get('file_name', ''))
+                    page = meta.get('page_label', meta.get('page_number', ''))
+
+                    if filename:
+                        cite_key = f"{filename}:{page}"
+                        if cite_key not in seen:
+                            seen.add(cite_key)
+                            if page:
+                                citations.append(f"📄 {filename}, page {page}")
+                            else:
+                                citations.append(f"📄 {filename}")
+        except Exception as e:
+            logger.debug(f"[{self.thread_id}] Citation extraction issue: {e}")
+
+        if citations:
+            return "\n\n---\n**Sources:** " + " | ".join(citations[:5])
+        return ""
+
+    # ══════════════════════════════════════════════════════════════
     # QUERYING — PUBLIC API
     # ══════════════════════════════════════════════════════════════
 
@@ -813,10 +1138,38 @@ class RAGEngine:
                 "Please upload a file first to start querying."
             )
 
-        logger.info(f"[{self.thread_id}] Query: {question[:100]}...")
+        # ── Step 1: Contextual query rewriting ───────────────────
+        enhanced_question = self._rewrite_query(question, chat_history)
+        logger.info(f"[{self.thread_id}] Query: {enhanced_question[:100]}...")
+
+        # ── Step 2: BM25 hybrid retrieval (for document queries) ──
+        bm25_context = ""
+        if ENABLE_HYBRID_SEARCH and self._all_nodes and self.vector_index is not None:
+            bm25_nodes = self._bm25_retrieve(enhanced_question, top_k=3)
+            if bm25_nodes:
+                bm25_texts = []
+                for node in bm25_nodes:
+                    text_content = node.get_content()[:500]
+                    source = node.metadata.get("source_filename", "")
+                    page = node.metadata.get("page_label", "")
+                    citation = f" [Source: {source}"
+                    if page:
+                        citation += f", page {page}"
+                    citation += "]"
+                    bm25_texts.append(text_content + citation)
+                bm25_context = "\n\n".join(bm25_texts)
+
+        # ── Step 3: Augment query with BM25 context ──────────────
+        final_query = enhanced_question
+        if bm25_context:
+            final_query = (
+                f"{enhanced_question}\n\n"
+                f"[Additional keyword-matched context for reference:\n"
+                f"{bm25_context}]"
+            )
 
         try:
-            response = await self.router_query_engine.aquery(question)
+            response = await self.router_query_engine.aquery(final_query)
             answer   = str(response).strip()
 
             # --- Check metadata for SQL results first ---
@@ -859,6 +1212,11 @@ class RAGEngine:
             # --- Post-process: clean technical jargon from the answer ---
             answer = self._sanitize_answer(answer)
 
+            # --- Add source citations ---
+            citations = self._extract_source_citations(response)
+            if citations:
+                answer += citations
+
             logger.info(f"[{self.thread_id}] Query answered ({len(answer)} chars)")
             return answer
         except Exception as e:
@@ -894,9 +1252,11 @@ class RAGEngine:
         lines = ["📁 **Loaded Files:**\n"]
         for f in files:
             if f["type"] == "unstructured":
+                content_types = f.get("content_types", [])
+                type_str = f" (content: {', '.join(content_types)})" if content_types else ""
                 lines.append(
                     f"- 📄 **{f['name']}** — {f.get('chunks', '?')} chunks "
-                    f"(indexed for search)"
+                    f"(indexed for search){type_str}"
                 )
             elif f["type"] == "structured":
                 tables = ", ".join(f.get("tables", []))
@@ -953,4 +1313,5 @@ class RAGEngine:
             self.sql_engine = None
         self.sql_database        = None
         self.router_query_engine = None
+        self._all_nodes          = []
         logger.info(f"[{self.thread_id}] RAGEngine closed")

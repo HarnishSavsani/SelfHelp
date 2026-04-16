@@ -239,6 +239,107 @@ class SQLiteDataLayer(BaseDataLayer):
         await db.commit()
         return feedback_id
 
+    # ── Feedback Reporting ────────────────────────────────────────────
+
+    async def get_feedback_report(
+        self,
+        user_identifier: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """
+        Query feedback data with full context: timestamp, user question,
+        assistant answer, feedback status, and comment.
+
+        Joins: feedbacks → steps (the rated assistant message) → threads
+        Then finds the preceding user_message step for the question.
+
+        Returns a list of dicts:
+            {
+                "timestamp": str,
+                "user": str,
+                "question": str,
+                "answer": str,
+                "status": "liked" | "not liked",
+                "value": int,
+                "comment": str | None,
+                "thread_id": str,
+            }
+        """
+        db = await self._get_db()
+
+        # Get all feedback records with their associated steps and threads
+        query = """
+            SELECT
+                f.id AS feedback_id,
+                f.for_id,
+                f.thread_id,
+                f.value,
+                f.comment,
+                s.output AS answer,
+                s.created_at AS answer_timestamp,
+                s.type AS step_type,
+                t.user_identifier
+            FROM feedbacks f
+            LEFT JOIN steps s ON s.id = f.for_id
+            LEFT JOIN threads t ON t.id = f.thread_id
+        """
+        params = []
+
+        if user_identifier:
+            query += " WHERE t.user_identifier = ?"
+            params.append(user_identifier)
+
+        query += " ORDER BY s.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        results = []
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        for row in rows:
+            thread_id = row["thread_id"]
+            for_id = row["for_id"]
+            answer_timestamp = row["answer_timestamp"] or ""
+
+            # Find the preceding user message in the same thread
+            question = ""
+            if thread_id and for_id:
+                q = """
+                    SELECT output FROM steps
+                    WHERE thread_id = ?
+                      AND type = 'user_message'
+                      AND created_at <= ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """
+                async with db.execute(q, (thread_id, answer_timestamp)) as q_cursor:
+                    q_row = await q_cursor.fetchone()
+                    if q_row:
+                        question = q_row["output"] or ""
+
+            # Map feedback value to human-readable status
+            value = row["value"]
+            if value == 1:
+                status = "liked"
+            elif value == 0:
+                status = "not liked"
+            else:
+                status = f"value={value}"
+
+            results.append({
+                "timestamp": answer_timestamp,
+                "user": row["user_identifier"] or "unknown",
+                "question": question,
+                "answer": (row["answer"] or "")[:500],  # Truncate long answers
+                "status": status,
+                "value": value,
+                "comment": row["comment"],
+                "thread_id": thread_id or "",
+                "feedback_id": row["feedback_id"],
+            })
+
+        return results
+
     # ── Elements ─────────────────────────────────────────────────────
 
     async def create_element(self, element: Element):

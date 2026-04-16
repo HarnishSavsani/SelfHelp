@@ -180,3 +180,4 @@ chainlit_data.db-*
 
 # RAG storage (per-session data)
 rag_storage/
+storage/

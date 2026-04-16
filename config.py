@@ -35,8 +35,19 @@ BASE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
 DUCKDB_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Embedding Model ───────────────────────────────────────────────
-EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# ── Embedding Provider ────────────────────────────────────────────
+# Options: "huggingface", "azure_custom"
+ACTIVE_EMBEDDING_PROVIDER = os.getenv("ACTIVE_EMBEDDING_PROVIDER", "huggingface")
+
+# HuggingFace embedding model (used when ACTIVE_EMBEDDING_PROVIDER=huggingface)
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-small-en-v1.5")
+
+# Azure Custom Embedding (used when ACTIVE_EMBEDDING_PROVIDER=azure_custom)
+AZURE_EMBEDDING_CONFIG = {
+    "base_url":  os.getenv("AZURE_EMBEDDING_BASE_URL", os.getenv("AZURE_BASE_URL", "https://genailab.tcs.in")),
+    "model":     os.getenv("AZURE_EMBEDDING_MODEL", "azure/genailab-maas-text-embedding-3-large"),
+    "api_key":   os.getenv("AZURE_EMBEDDING_API_KEY", os.getenv("AZURE_HACKATHON_API_KEY", "")),
+}
 
 # ── Ollama Configuration ──────────────────────────────────────────
 OLLAMA_CONFIG = {
@@ -56,8 +67,9 @@ AZURE_CUSTOM_CONFIG = {
 
 # ── RAG Tuning ────────────────────────────────────────────────────
 CHUNK_SIZE        = 512
-CHUNK_OVERLAP     = 50
+CHUNK_OVERLAP     = 128
 SIMILARITY_TOP_K  = 5
+ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
 
 # ── Safety Limits ─────────────────────────────────────────────────
 MAX_FILE_SIZE_MB       = 50
