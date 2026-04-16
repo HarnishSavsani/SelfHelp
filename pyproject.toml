@@ -26,12 +26,13 @@ dependencies = [
     "duckdb-engine>=0.15.0",
     "sentence-transformers>=3.0.0",
     "pyyaml>=6.0",
-    "llama-index-embeddings-langchain>=0.5.0",
+    "llama-index-embeddings-langchain>=0.3.0",
     "rank-bm25>=0.2.2",
-    "docling>=2.88.0",
-    "llama-index-readers-docling>=0.4.2",
-    "llama-index-node-parser-docling>=0.4.2",
     "pydantic>=2.10.0",
     "loguru>=0.7.3",
-    "pymupdf4llm>=1.27.2.2",
+    "pymupdf4llm>=0.0.17",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
