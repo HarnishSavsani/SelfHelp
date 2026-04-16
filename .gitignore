@@ -181,3 +181,10 @@ chainlit_data.db-*
 # RAG storage (per-session data)
 rag_storage/
 storage/
+
+# AI Models (large binaries)
+models/
+*.safetensors
+*.bin
+*.onnx
+*.pth

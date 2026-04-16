@@ -21,9 +21,7 @@ duckdb>=1.0.0
 duckdb-engine>=0.15.0
 sentence-transformers>=3.0.0
 pyyaml>=6.0
-# Advanced PDF parsing (IBM Docling)
-docling>=2.0.0
-llama-index-readers-docling>=0.3.0
-llama-index-node-parser-docling>=0.3.0
+# Lightweight PDF parsing (replaces Docling — no model files needed)
+pymupdf4llm>=0.0.17
 # Hybrid retrieval (BM25 keyword search)
 rank-bm25>=0.2.2

@@ -30,16 +30,37 @@ BASE_STORAGE_DIR = Path("./storage/rag")
 CHROMA_DB_DIR    = BASE_STORAGE_DIR / "chroma_db"
 DUCKDB_DIR       = BASE_STORAGE_DIR / "duckdb"
 
+# ── Local Models Cache ────────────────────────────────────────────
+# We keep any downloaded HuggingFace/SentenceTransformers models here so:
+# - first run can download if missing
+# - subsequent runs can be fully offline (local_files_only)
+MODELS_DIR = Path("./models")
+HF_HOME_DIR = MODELS_DIR / "hub"
+
 # Ensure base directories exist on import
 BASE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
 DUCKDB_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+HF_HOME_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ensure all HuggingFace downloads (models/tokenizers) land inside ./models/hub
+# so the app can run offline after the first successful download.
+os.environ.setdefault("HF_HOME", str(HF_HOME_DIR))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_HOME_DIR))
 
 # ── Embedding Provider ────────────────────────────────────────────
-# Options: "huggingface", "azure_custom"
+# Options:
+#   - "none"        → disable embeddings entirely (BM25-only document search)
+#   - "huggingface" → local SentenceTransformers model (downloads once, cached)
+#   - "azure_custom"→ Azure-hosted embedding via LangChain wrapper
+#
+# If you want **zero external model downloads**, set:
+#   ACTIVE_EMBEDDING_PROVIDER=none
 ACTIVE_EMBEDDING_PROVIDER = os.getenv("ACTIVE_EMBEDDING_PROVIDER", "huggingface")
 
-# HuggingFace embedding model (used when ACTIVE_EMBEDDING_PROVIDER=huggingface)
+# SentenceTransformers embedding model (used when ACTIVE_EMBEDDING_PROVIDER=huggingface)
+# This model is ~80MB and auto-downloads on first use, then cached locally.
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-small-en-v1.5")
 
 # Azure Custom Embedding (used when ACTIVE_EMBEDDING_PROVIDER=azure_custom)
@@ -71,6 +92,16 @@ CHUNK_OVERLAP     = 128
 SIMILARITY_TOP_K  = 5
 ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
 
+# ── Document Retrieval Mode ───────────────────────────────────────
+# Options:
+#   - "hybrid" → vector + BM25 (requires embeddings + ChromaDB)
+#   - "bm25"   → BM25-only (no embeddings, no ChromaDB)
+DOCUMENT_RETRIEVAL_MODE = os.getenv("DOCUMENT_RETRIEVAL_MODE", "hybrid").lower()
+
+# ── Source Display ────────────────────────────────────────────────
+# Append a small "Sources" block at the end of RAG answers.
+SHOW_SOURCES = os.getenv("SHOW_SOURCES", "true").lower() == "true"
+
 # ── Safety Limits ─────────────────────────────────────────────────
 MAX_FILE_SIZE_MB       = 50
 MAX_FILES_PER_SESSION  = 20
@@ -95,4 +126,3 @@ INITIAL_USERS = [
     ("aniket@genius.ai", DEFAULT_USER_PASSWORD, "USER"),
     ("avnish@genius.ai", DEFAULT_USER_PASSWORD, "USER"),
 ]
-

@@ -10,7 +10,8 @@ Supported LLM providers (ACTIVE_LLM_PROVIDER in config.py / .env):
   - "azure_custom"  → Azure-hosted custom endpoint via LangChain wrapper
 
 Supported Embedding providers (ACTIVE_EMBEDDING_PROVIDER):
-  - "huggingface"   → local HuggingFace model (default: BAAI/bge-small-en-v1.5)
+  - "none"         → disable embeddings entirely (BM25-only document search)
+  - "huggingface"   → local SentenceTransformers model (default: BAAI/bge-small-en-v1.5)
   - "azure_custom"  → Azure-hosted embedding via LangChain wrapper
 """
 
@@ -25,18 +26,26 @@ from config import (
     AZURE_EMBEDDING_CONFIG,
     OLLAMA_CONFIG,
     EMBED_MODEL_NAME,
+    HF_HOME_DIR,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── Embedding (cached singleton) ─────────────────────────────────
-_embed_model = None
+_UNSET = object()
+_embed_model = _UNSET
 
 
 def get_embed_model():
     """Return (and cache) the embedding model based on ACTIVE_EMBEDDING_PROVIDER."""
     global _embed_model
-    if _embed_model is not None:
+    if _embed_model is not _UNSET:
+        return _embed_model
+
+    if ACTIVE_EMBEDDING_PROVIDER == "none":
+        _embed_model = None
+        Settings.embed_model = None
+        logger.info("Embeddings disabled (ACTIVE_EMBEDDING_PROVIDER='none').")
         return _embed_model
 
     if ACTIVE_EMBEDDING_PROVIDER == "azure_custom":
@@ -49,11 +58,74 @@ def get_embed_model():
 
 
 def _build_huggingface_embedding():
-    """Build a local HuggingFace embedding model."""
+    """Build a local SentenceTransformers embedding model.
+
+    Uses llama_index's HuggingFaceEmbedding which wraps SentenceTransformers.
+    The model (~80MB) auto-downloads on first use and is cached locally.
+    No heavy HuggingFace Hub or Docling dependencies needed.
+    """
+    import os
+    from pathlib import Path
+
     from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-    logger.info(f"Loading HuggingFace embedding model: {EMBED_MODEL_NAME}")
-    return HuggingFaceEmbedding(model_name=EMBED_MODEL_NAME)
+    logger.info(f"Loading SentenceTransformers embedding: {EMBED_MODEL_NAME}")
+
+    def _repo_id_to_cache_dir(repo_id: str, hf_home: Path) -> Path:
+        # HuggingFace hub cache layout: <HF_HOME>/models--ORG--NAME/...
+        # Example: BAAI/bge-small-en-v1.5 -> models--BAAI--bge-small-en-v1.5
+        return hf_home / ("models--" + repo_id.replace("/", "--"))
+
+    def _has_local_snapshot(repo_id: str, hf_home: Path) -> bool:
+        model_dir = _repo_id_to_cache_dir(repo_id, hf_home)
+        snapshots = model_dir / "snapshots"
+        if not snapshots.exists():
+            return False
+        # Any snapshot dir indicates a previously downloaded model.
+        try:
+            return any(p.is_dir() for p in snapshots.iterdir())
+        except Exception:
+            return False
+
+    # If the model already exists locally, load strictly from disk.
+    local_only = _has_local_snapshot(EMBED_MODEL_NAME, HF_HOME_DIR)
+    model_kwargs = {"local_files_only": True} if local_only else {}
+
+    try:
+        def _load(local_files_only: bool):
+            return HuggingFaceEmbedding(
+                model_name=EMBED_MODEL_NAME,
+                cache_folder=str(HF_HOME_DIR),
+                model_kwargs={"local_files_only": True} if local_files_only else {},
+            )
+
+        # 1) If we have a cached snapshot, prefer strict offline load.
+        if local_only:
+            try:
+                return _load(local_files_only=True)
+            except Exception as e:
+                logger.warning(
+                    "Local embedding cache exists but failed to load. "
+                    "Re-downloading into ./models/hub to repair the cache. "
+                    f"Error: {type(e).__name__}: {e}"
+                )
+                # Fall through to a fresh download.
+
+        # 2) Otherwise, allow a download (first-time), but ensure it lands in ./models/hub.
+        embed = _load(local_files_only=False)
+        # After a first-time download, ensure the *next* load is offline-only.
+        if not local_only and _has_local_snapshot(EMBED_MODEL_NAME, HF_HOME_DIR):
+            logger.info(
+                "Embedding model cached under ./models/hub; subsequent runs can be offline."
+            )
+        return embed
+    except Exception as e:
+        logger.error(
+            f"Failed to load embedding model '{EMBED_MODEL_NAME}'. "
+            "Ensure 'sentence-transformers' is installed and the model "
+            "is available (it auto-downloads on first use into ./models/hub)."
+        )
+        raise e
 
 
 def _build_azure_embedding():
@@ -108,7 +180,7 @@ def setup_global_llm():
     # Register globally — LlamaIndex reads Settings.llm everywhere
     Settings.llm = llm
 
-    # Always ensure the embedding model is also registered
+    # Register embedding model (or disable embeddings) for the session
     get_embed_model()
 
     model_label = (

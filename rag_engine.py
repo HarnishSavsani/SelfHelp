@@ -1,5 +1,5 @@
 """
-rag_engine.py — Genius AI RAG Engine
+rag_engine.py — Genius AI RAG Engine (Lightweight)
 
 Single-file RAG abstraction managing two pipelines:
   1. Unstructured (PDF/MD/TXT) → ChromaDB vector search (+ BM25 hybrid)
@@ -13,11 +13,11 @@ Design Principles:
   - Zero dependency on Chainlit internals (clean separation)
   - Incremental ingestion — files can be added mid-conversation
 
-Advanced Features:
-  - Docling PDF parsing (tables, code, figures, OCR)
-  - Hybrid retrieval (BM25 keyword + vector semantic)
-  - Contextual query rewriting using chat history
-  - Source citations in responses
+Lightweight Architecture:
+  - PDF parsing via PyMuPDF4LLM (zero model files, instant startup)
+  - Optional embeddings (SentenceTransformers) for vector search
+  - BM25 keyword retrieval (can run with embeddings disabled)
+  - No Docling, no heavy HuggingFace pipeline, no runtime downloads
 """
 
 import json
@@ -32,7 +32,6 @@ from typing import Optional
 import duckdb
 import pandas as pd
 
-import chromadb
 from llama_index.core import (
     Settings,
     StorageContext,
@@ -42,7 +41,6 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.readers import SimpleDirectoryReader
 from llama_index.core.schema import Document, TextNode
-from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from llama_index.core import SQLDatabase
 from llama_index.core.query_engine import NLSQLTableQueryEngine
@@ -63,6 +61,8 @@ from config import (
     UNSTRUCTURED_EXTENSIONS,
     STRUCTURED_EXTENSIONS,
     ENABLE_HYBRID_SEARCH,
+    DOCUMENT_RETRIEVAL_MODE,
+    SHOW_SOURCES,
 )
 from app_profile import profile
 
@@ -74,26 +74,19 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 
 DOCUMENT_QA_PROMPT = PromptTemplate(
-    "You are a meticulous document analyst. Answer the question using ONLY the "
-    "context provided below. Follow these rules strictly:\n\n"
-    "RULES:\n"
-    "1. Answer ONLY from the provided context. If the context does not contain "
-    "enough information, say 'Based on the available document content, I don't "
-    "have enough information to fully answer this question.'\n"
-    "2. ALWAYS cite your sources. Use format: (Source: filename, page X) when "
-    "page numbers are available.\n"
-    "3. When the context contains tables, reproduce them as formatted markdown tables.\n"
-    "4. When the context contains code, reproduce it in proper code blocks.\n"
-    "5. When listing key metrics or data points, use bullet points with bold values.\n"
-    "6. Be precise — include specific numbers, percentages, names, and dates.\n"
-    "7. Use emojis sparingly to improve readability.\n"
-    "8. Structure your answer with headers if the response is long.\n\n"
-    "-----\n"
-    "CONTEXT:\n"
-    "{context_str}\n"
-    "-----\n\n"
-    "Question: {query_str}\n\n"
-    "Detailed Answer: "
+    "You are a helpful assistant answering questions about the user's uploaded document.\n\n"
+    "Rules:\n"
+    "1. Use ONLY the information in the context.\n"
+    "2. If the answer is not in the context, say so plainly and suggest what to ask/look for.\n"
+    "3. Be natural and concise. Prefer a short paragraph + bullets when listing items.\n"
+    "4. If the user asks \"who\", \"which\", \"where\", or \"what are\", extract exact names/labels.\n"
+    "5. Only include IDs/codes if the user asked for them or they are needed to disambiguate.\n"
+    "6. Do NOT mention \"context\", \"chunks\", \"retriever\", or other internal details.\n"
+    "7. Do NOT add a separate \"Sources\" section.\n\n"
+    "Context:\n"
+    "{context_str}\n\n"
+    "Question: {query_str}\n"
+    "Answer: "
 )
 
 
@@ -130,27 +123,46 @@ class RAGEngine:
         # ── Embedding model ───────────────────────────────────────
         self.embed_model = embed_model or Settings.embed_model
 
+        # ── Document retrieval mode ───────────────────────────────
+        self.document_retrieval_mode = DOCUMENT_RETRIEVAL_MODE
+        self._embeddings_enabled = (
+            self.document_retrieval_mode != "bm25" and self.embed_model is not None
+        )
+
+        # ── BM25 persistence (works with or without embeddings) ───
+        self.bm25_nodes_path = self.duckdb_path.parent / "bm25_nodes.jsonl"
+
         # ── ChromaDB (Vector Store) ───────────────────────────────
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(self.chroma_dir),
-        )
-        self.chroma_collection = self.chroma_client.get_or_create_collection(
-            "documents",
-        )
-        self.vector_store = ChromaVectorStore(
-            chroma_collection=self.chroma_collection,
-        )
+        # Only initialize vector search when embeddings are enabled.
+        self.chroma_client = None
+        self.chroma_collection = None
+        self.vector_store = None
         self.vector_index: Optional[VectorStoreIndex] = None
 
-        if self.chroma_collection.count() > 0:
-            self.vector_index = VectorStoreIndex.from_vector_store(
-                vector_store=self.vector_store,
-                embed_model=self.embed_model,
-            )
-            logger.info(
-                f"[{thread_id}] Restored ChromaDB vector index "
-                f"({self.chroma_collection.count()} vectors)"
-            )
+        if self._embeddings_enabled:
+            # Lazy import to avoid pulling vector-store dependencies when running BM25-only.
+            import chromadb  # type: ignore[import]
+            from llama_index.vector_stores.chroma import ChromaVectorStore  # type: ignore[import]
+
+            self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_dir))
+            self.chroma_collection = self.chroma_client.get_or_create_collection("documents")
+            self.vector_store = ChromaVectorStore(chroma_collection=self.chroma_collection)
+
+            if self.chroma_collection.count() > 0:
+                self.vector_index = VectorStoreIndex.from_vector_store(
+                    vector_store=self.vector_store,
+                    embed_model=self.embed_model,
+                )
+                logger.info(
+                    f"[{thread_id}] Restored ChromaDB vector index "
+                    f"({self.chroma_collection.count()} vectors)"
+                )
+        else:
+            if self.document_retrieval_mode != "bm25":
+                logger.warning(
+                    f"[{thread_id}] Embeddings disabled; falling back to BM25-only "
+                    f"(DOCUMENT_RETRIEVAL_MODE={self.document_retrieval_mode!r})."
+                )
 
         # ── DuckDB (Structured SQL) ───────────────────────────────
         self.sql_engine   = None
@@ -176,7 +188,14 @@ class RAGEngine:
         # ── File tracking ─────────────────────────────────────────
         self.metadata = self._load_metadata()
 
-        if self.vector_index or self.sql_tables:
+        # Restore BM25 nodes (so BM25-only mode still works after resume)
+        self._load_bm25_nodes()
+        # If the session was previously indexed before BM25 persistence existed,
+        # try to rebuild BM25 nodes from Chroma (no embeddings required).
+        if not self._all_nodes:
+            self._bootstrap_bm25_nodes_from_chroma()
+
+        if self.vector_index or self.sql_tables or self._all_nodes:
             self._rebuild_router()
 
         logger.info(f"[{thread_id}] RAGEngine initialized")
@@ -260,6 +279,100 @@ class RAGEngine:
         with open(self.metadata_path, "w") as f:
             json.dump(self.metadata, f, indent=2, default=str)
         logger.info(f"[{self.thread_id}] Metadata saved")
+
+    # ══════════════════════════════════════════════════════════════
+    # BM25 NODE PERSISTENCE (FOR BM25-ONLY MODE + RESUME)
+    # ══════════════════════════════════════════════════════════════
+
+    def _persist_nodes_for_bm25(self, nodes: list[TextNode]):
+        """Append nodes to the BM25 store on disk for resume support."""
+        if not nodes:
+            return
+
+        # Keep an in-memory copy for fast BM25 retrieval
+        self._all_nodes.extend(nodes)
+
+        try:
+            self.bm25_nodes_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.bm25_nodes_path, "a", encoding="utf-8") as f:
+                for node in nodes:
+                    rec = {
+                        "id": getattr(node, "node_id", None),
+                        "text": node.get_content(),
+                        "metadata": getattr(node, "metadata", {}) or {},
+                    }
+                    f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] Failed to persist BM25 nodes: {e}")
+
+    def _load_bm25_nodes(self):
+        """Load persisted nodes for BM25 retrieval (best-effort)."""
+        if not self.bm25_nodes_path.exists():
+            return
+
+        loaded = 0
+        try:
+            with open(self.bm25_nodes_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    text = rec.get("text", "")
+                    if not text:
+                        continue
+                    meta = rec.get("metadata") or {}
+                    node_id = rec.get("id")
+                    try:
+                        node = TextNode(text=text, metadata=meta, id_=node_id)
+                    except Exception:
+                        node = TextNode(text=text, metadata=meta)
+                    self._all_nodes.append(node)
+                    loaded += 1
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] Failed to load BM25 nodes: {e}")
+
+        if loaded:
+            logger.info(f"[{self.thread_id}] Restored {loaded} BM25 nodes from disk")
+
+    def _bootstrap_bm25_nodes_from_chroma(self):
+        """Best-effort: rebuild BM25 nodes from an existing Chroma collection.
+
+        This helps when older sessions were indexed into Chroma before we started
+        persisting `bm25_nodes.jsonl`.
+        """
+        if self._all_nodes:
+            return
+        if not self.chroma_dir.exists():
+            return
+
+        try:
+            import chromadb  # type: ignore[import]
+
+            client = chromadb.PersistentClient(path=str(self.chroma_dir))
+            collection = client.get_or_create_collection("documents")
+            if collection.count() <= 0:
+                return
+
+            data = collection.get(include=["documents", "metadatas"])
+            docs = data.get("documents") or []
+            metas = data.get("metadatas") or []
+
+            rebuilt = []
+            for text, meta in zip(docs, metas):
+                if not text:
+                    continue
+                try:
+                    rebuilt.append(TextNode(text=text, metadata=meta or {}))
+                except Exception:
+                    continue
+
+            if rebuilt:
+                # Persist so future resumes are fast and Chroma isn't required for BM25 mode.
+                self._persist_nodes_for_bm25(rebuilt)
+                logger.info(f"[{self.thread_id}] Bootstrapped {len(rebuilt)} BM25 nodes from Chroma")
+        except Exception as e:
+            logger.warning(f"[{self.thread_id}] Failed to bootstrap BM25 nodes from Chroma: {e}")
 
     def _add_file_metadata(
         self,
@@ -393,7 +506,7 @@ class RAGEngine:
         ext = Path(file_name).suffix.lower()
 
         if ext == ".pdf":
-            return await self._ingest_pdf_advanced(file_path, file_name)
+            return await self._ingest_pdf(file_path, file_name)
         else:
             return await self._ingest_text_file(file_path, file_name)
 
@@ -419,64 +532,92 @@ class RAGEngine:
         self._index_nodes(nodes)
         self._add_file_metadata(file_name, "unstructured", chunks=len(nodes))
 
+        mode_line = (
+            "- 🔎 **Indexed for**: hybrid search (keyword + semantic)\n"
+            if self._embeddings_enabled
+            else "- 🔎 **Indexed for**: keyword search (no embeddings)\n"
+        )
         return (
             f"📄 **{file_name}** processed successfully!\n\n"
-            f"- **{len(nodes)}** document chunks indexed for semantic search\n"
+            f"- 📦 **{len(nodes)}** sections added\n"
+            + mode_line +
             f"- You can now ask questions about this document's content."
         )
 
-    async def _ingest_pdf_advanced(self, file_path: str, file_name: str) -> str:
+    async def _ingest_pdf(self, file_path: str, file_name: str) -> str:
         """
-        Ingest PDF files using IBM Docling for advanced extraction.
+        Ingest PDF files using PyMuPDF4LLM for high-quality markdown extraction.
 
-        Docling provides:
-          - Layout analysis (DocLayNet AI model)
-          - Table extraction (TableFormer)
-          - Figure/chart detection
-          - OCR for scanned pages
+        PyMuPDF4LLM advantages over Docling:
+          - Zero model files needed (no .safetensors, no runtime downloads)
+          - Instant startup (no layout model initialization)
+          - Preserves tables as markdown tables
+          - Preserves headers, lists, and formatting
+          - Page-level metadata for accurate source citations
 
         Chunking uses MarkdownNodeParser which splits by markdown headers
-        (##, ###) keeping tables, code blocks, and lists intact within
-        their sections — unlike SentenceSplitter which cuts at arbitrary
-        character boundaries and destroys table structure.
+        (##, ###) keeping tables and lists intact within their sections.
         """
         try:
-            from llama_index.readers.docling import DoclingReader
-            from llama_index.core.node_parser import MarkdownNodeParser
+            import pymupdf4llm
 
-            logger.info(f"[{self.thread_id}] Using Docling for advanced PDF parsing: {file_name}")
+            logger.info(f"[{self.thread_id}] Using PyMuPDF4LLM for PDF parsing: {file_name}")
 
-            # Step 1: Parse with DoclingReader (outputs structured Markdown)
-            # Docling converts tables to proper Markdown tables, preserves
-            # code blocks, identifies figures, and handles multi-column layouts.
-            reader = DoclingReader()
-            documents = reader.load_data(file_path=file_path)
+            # Extract PDF as structured markdown (preserves tables, headers, lists)
+            md_text = pymupdf4llm.to_markdown(file_path, page_chunks=True)
 
-            if not documents:
-                logger.warning(f"[{self.thread_id}] Docling returned no documents, falling back to simple reader")
+            if not md_text:
+                logger.warning(f"[{self.thread_id}] PyMuPDF4LLM returned no content, falling back to simple reader")
                 return await self._ingest_text_file(file_path, file_name)
 
-            # Step 2: Enrich metadata
-            for doc in documents:
-                doc.metadata.update({
-                    "source_filename": file_name,
-                    "upload_time":     datetime.now(timezone.utc).isoformat(),
-                    "thread_id":       self.thread_id,
-                    "parser":          "docling",
-                })
+            # Build LlamaIndex Document objects with per-page metadata
+            documents = []
+            if isinstance(md_text, list):
+                # page_chunks=True returns a list of dicts with 'text' and 'metadata'
+                for page_data in md_text:
+                    page_text = page_data.get("text", "") if isinstance(page_data, dict) else str(page_data)
+                    page_meta = page_data.get("metadata", {}) if isinstance(page_data, dict) else {}
 
-            # Log the Markdown output size for debugging
+                    if not page_text.strip():
+                        continue
+
+                    doc = Document(
+                        text=page_text,
+                        metadata={
+                            "source_filename": file_name,
+                            "page_label":      str(page_meta.get("page", "")),
+                            "upload_time":     datetime.now(timezone.utc).isoformat(),
+                            "thread_id":       self.thread_id,
+                            "parser":          "pymupdf4llm",
+                        },
+                    )
+                    documents.append(doc)
+            else:
+                # Single string fallback
+                documents.append(Document(
+                    text=str(md_text),
+                    metadata={
+                        "source_filename": file_name,
+                        "upload_time":     datetime.now(timezone.utc).isoformat(),
+                        "thread_id":       self.thread_id,
+                        "parser":          "pymupdf4llm",
+                    },
+                ))
+
+            if not documents:
+                return f"⚠️ No content could be extracted from `{file_name}`."
+
             total_chars = sum(len(doc.get_content()) for doc in documents)
             logger.info(
-                f"[{self.thread_id}] Docling extracted {total_chars} chars "
-                f"of Markdown from {file_name}"
+                f"[{self.thread_id}] PyMuPDF4LLM extracted {total_chars} chars "
+                f"from {len(documents)} pages of {file_name}"
             )
 
-            # Step 3: Structure-aware chunking with MarkdownNodeParser
-            # This splits by markdown headers (##, ###), keeping tables,
-            # code blocks, and lists intact within their sections.
-            # This is critical — SentenceSplitter would cut tables in half.
+            # Structure-aware chunking via MarkdownNodeParser
+            # Splits by markdown headers (##, ###), keeping tables and lists intact
             try:
+                from llama_index.core.node_parser import MarkdownNodeParser
+
                 md_parser = MarkdownNodeParser()
                 nodes = md_parser.get_nodes_from_documents(documents)
 
@@ -492,7 +633,6 @@ class RAGEngine:
                 for node in nodes:
                     content_len = len(node.get_content())
                     if content_len > 2000:
-                        # Re-split oversized sections but with generous limits
                         sub_doc = Document(
                             text=node.get_content(),
                             metadata=node.metadata.copy(),
@@ -522,7 +662,7 @@ class RAGEngine:
                 )
                 nodes = splitter.get_nodes_from_documents(documents)
 
-            # Step 4: Classify content types found in chunks
+            # Classify content types found in chunks
             content_types = set()
             for node in nodes:
                 text_lower = node.get_content().lower()
@@ -530,11 +670,9 @@ class RAGEngine:
                     content_types.add("tables")
                 if "```" in text_lower:
                     content_types.add("code")
-                if "figure" in text_lower or "image" in text_lower:
-                    content_types.add("figures")
                 content_types.add("text")
 
-            # Step 5: Index nodes into ChromaDB + BM25
+            # Index nodes into ChromaDB + BM25
             self._index_nodes(nodes)
             self._add_file_metadata(
                 file_name, "unstructured",
@@ -542,32 +680,48 @@ class RAGEngine:
                 content_types=list(content_types),
             )
 
-            # Build a rich summary
             type_summary = ", ".join(sorted(content_types))
+            mode_line = (
+                "- 🔎 **Indexed for**: hybrid search (keyword + semantic)\n"
+                if self._embeddings_enabled
+                else "- 🔎 **Indexed for**: keyword search (no embeddings)\n"
+            )
             return (
-                f"📄 **{file_name}** processed with advanced parsing!\n\n"
-                f"- 🔬 **Parser**: Docling (layout analysis + table extraction)\n"
-                f"- 📦 **{len(nodes)}** structure-aware chunks indexed\n"
+                f"📄 **{file_name}** processed successfully!\n\n"
+                f"- 🔬 **Parser**: PyMuPDF4LLM (lightweight)\n"
+                f"- 📦 **{len(nodes)}** structure-aware sections added\n"
+                + mode_line +
                 f"- 📋 **Content detected**: {type_summary}\n"
                 f"- You can now ask questions about tables, text, and data in this document."
             )
 
-        except ImportError as e:
+        except ImportError:
             logger.warning(
-                f"[{self.thread_id}] Docling not available ({e}), "
+                f"[{self.thread_id}] pymupdf4llm not installed, "
                 f"falling back to simple reader"
             )
             return await self._ingest_text_file(file_path, file_name)
 
         except Exception as e:
             logger.warning(
-                f"[{self.thread_id}] Docling parsing failed for {file_name}: {e}. "
+                f"[{self.thread_id}] PyMuPDF4LLM parsing failed for {file_name}: {e}. "
                 f"Falling back to simple reader."
             )
             return await self._ingest_text_file(file_path, file_name)
 
     def _index_nodes(self, nodes: list):
-        """Index nodes into ChromaDB vector store and store for BM25."""
+        """Index nodes for retrieval.
+
+        - Always persists nodes for BM25 keyword retrieval (and resume support).
+        - Optionally indexes into ChromaDB for vector retrieval when enabled.
+        """
+        # Persist for BM25 (and keep in-memory copy)
+        self._persist_nodes_for_bm25(nodes)
+
+        # Vector indexing is optional
+        if not self._embeddings_enabled:
+            return
+
         storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
 
         if self.vector_index is None:
@@ -578,9 +732,6 @@ class RAGEngine:
             )
         else:
             self.vector_index.insert_nodes(nodes)
-
-        # Store nodes for BM25 hybrid retrieval
-        self._all_nodes.extend(nodes)
 
     # ══════════════════════════════════════════════════════════════
     # STRUCTURED INGESTION (Excel, CSV, JSON → DuckDB)
@@ -758,12 +909,33 @@ class RAGEngine:
         try:
             from rank_bm25 import BM25Okapi
 
+            def _tokenize(text: str) -> list[str]:
+                # Basic, fast tokenizer that is robust to punctuation.
+                return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+            def _normalize_query(q: str) -> str:
+                # Cheap typo-fixes for common user inputs (keeps BM25 usable without embeddings).
+                # NOTE: Keep this list small and obvious to avoid surprising rewrites.
+                fixes = {
+                    "spco": "spoc",
+                    "sopc": "spoc",
+                    "sopoc": "spoc",
+                    "fro": "for",
+                }
+                toks = _tokenize(q)
+                toks = [fixes.get(t, t) for t in toks]
+                # Expand a few helpful synonyms when the user is asking for a point-of-contact.
+                if "spoc" in toks:
+                    toks.extend(["spocs", "poc", "contact", "sme", "expert"])
+                return " ".join(toks)
+
             # Tokenize stored node texts
-            corpus = [node.get_content().lower().split() for node in self._all_nodes]
+            corpus = [_tokenize(node.get_content()) for node in self._all_nodes]
             bm25 = BM25Okapi(corpus)
 
             # Score the query
-            query_tokens = query.lower().split()
+            normalized_query = _normalize_query(query)
+            query_tokens = _tokenize(normalized_query)
             scores = bm25.get_scores(query_tokens)
 
             # Get top-k nodes by BM25 score
@@ -850,7 +1022,9 @@ class RAGEngine:
         """Rebuild the RouterQueryEngine whenever a new data source is added."""
         tools = []
 
-        if self.vector_index is not None:
+        # ── Document search tool ─────────────────────────────────
+        # Prefer hybrid/vector when available, otherwise fall back to BM25-only.
+        if self.vector_index is not None and self.document_retrieval_mode != "bm25":
             from llama_index.core.retrievers import BaseRetriever
             from llama_index.core.schema import NodeWithScore
             from llama_index.core.query_engine import RetrieverQueryEngine
@@ -889,6 +1063,40 @@ class RAGEngine:
 
             self.vector_query_engine = RetrieverQueryEngine.from_args(
                 retriever=hybrid_retriever,
+                llm=self.llm,
+                text_qa_template=DOCUMENT_QA_PROMPT,
+            )
+            tools.append(
+                QueryEngineTool.from_defaults(
+                    query_engine=self.vector_query_engine,
+                    name="document_search",
+                    description=(
+                        "Useful for searching through uploaded documents "
+                        "(PDFs, text files, markdown). Use this when the user "
+                        "asks questions about document content, policies, "
+                        "reports, tables in documents, code snippets, "
+                        "figures, charts, or any unstructured text."
+                    ),
+                )
+            )
+        elif self._all_nodes:
+            from llama_index.core.retrievers import BaseRetriever
+            from llama_index.core.schema import NodeWithScore
+            from llama_index.core.query_engine import RetrieverQueryEngine
+
+            class BM25OnlyRetriever(BaseRetriever):
+                def __init__(self, bm25_func):
+                    self.bm25_func = bm25_func
+                    super().__init__()
+
+                def _retrieve(self, query_bundle):
+                    # Pull a wider net in BM25-only mode (typos / acronyms benefit).
+                    raw = self.bm25_func(query_bundle.query_str, top_k=max(SIMILARITY_TOP_K, 12))
+                    return [NodeWithScore(node=n, score=1.0) for n in raw]
+
+            bm25_retriever = BM25OnlyRetriever(self._bm25_retrieve)
+            self.vector_query_engine = RetrieverQueryEngine.from_args(
+                retriever=bm25_retriever,
                 llm=self.llm,
                 text_qa_template=DOCUMENT_QA_PROMPT,
             )
@@ -1131,6 +1339,18 @@ class RAGEngine:
         for pattern, replacement in replacements:
             answer = re.sub(pattern, replacement, answer)
 
+        # Light cleanup for internal RAG jargon (keeps answers feeling natural).
+        tech_cleanup = [
+            (r"\b[Rr]etrieval-augmented generation\b", "document search"),
+            (r"\bRAG\b", "document search"),
+            (r"\b[Bb]m25\b", "keyword search"),
+            (r"\b[Vv]ector (?:search|index|store)\b", "search"),
+            (r"\b[Ee]mbeddings?\b", "search signals"),
+            (r"\b[Cc]hunks?\b", "sections"),
+        ]
+        for pattern, replacement in tech_cleanup:
+            answer = re.sub(pattern, replacement, answer)
+
         return answer
 
     # ══════════════════════════════════════════════════════════════
@@ -1139,6 +1359,9 @@ class RAGEngine:
 
     def _extract_source_citations(self, response) -> str:
         """Extract source citations from query response metadata."""
+        if not SHOW_SOURCES:
+            return ""
+
         citations = []
         try:
             if hasattr(response, 'source_nodes'):
@@ -1160,7 +1383,11 @@ class RAGEngine:
             logger.debug(f"[{self.thread_id}] Citation extraction issue: {e}")
 
         if citations:
-            return "\n\n---\n**Sources:** " + " | ".join(citations[:5])
+            # Keep the answer readable: short, scannable sources list.
+            lines = ["", "Sources:"]
+            for c in citations[:5]:
+                lines.append(f"- {c}")
+            return "\n" + "\n".join(lines)
         return ""
 
     # ══════════════════════════════════════════════════════════════
@@ -1174,8 +1401,14 @@ class RAGEngine:
                 "Please upload a file first to start querying."
             )
 
-        # ── Step 1: Contextual query rewriting ───────────────────
-        enhanced_question = self._rewrite_query(question, chat_history)
+        # ── Step 1: Cheap typo normalization (helps BM25-only mode) ────────
+        # Keep this intentionally small to avoid surprising rewrites.
+        enhanced_question = question
+        enhanced_question = re.sub(r"\bspco\b", "spoc", enhanced_question, flags=re.IGNORECASE)
+        enhanced_question = re.sub(r"\bfro\b", "for", enhanced_question, flags=re.IGNORECASE)
+
+        # ── Step 2: Contextual query rewriting (LLM) ───────────────────────
+        enhanced_question = self._rewrite_query(enhanced_question, chat_history)
         logger.info(f"[{self.thread_id}] Query: {enhanced_question[:100]}...")
 
         # (Hybrid search is now handled natively via the HybridRetriever in the router)
@@ -1223,11 +1456,6 @@ class RAGEngine:
             # --- Post-process: clean technical jargon from the answer ---
             answer = self._sanitize_answer(answer)
 
-            # --- Add source citations ---
-            citations = self._extract_source_citations(response)
-            if citations:
-                answer += citations
-
             logger.info(f"[{self.thread_id}] Query answered ({len(answer)} chars)")
             return answer
         except Exception as e:
@@ -1253,7 +1481,7 @@ class RAGEngine:
     # ══════════════════════════════════════════════════════════════
 
     def has_data(self) -> bool:
-        return self.vector_index is not None or len(self.sql_tables) > 0
+        return bool(self._all_nodes) or self.vector_index is not None or len(self.sql_tables) > 0
 
     def get_loaded_files_summary(self) -> str:
         files = self.metadata.get("files", [])
@@ -1293,8 +1521,9 @@ class RAGEngine:
 
         has_vectors = chroma_dir.exists()
         has_duckdb  = duckdb_path.exists()
+        has_bm25    = (DUCKDB_DIR / thread_id / "bm25_nodes.jsonl").exists()
 
-        if not has_vectors and not has_duckdb:
+        if not has_vectors and not has_duckdb and not has_bm25:
             logger.info(f"[{thread_id}] No RAG storage found for resume")
             return None
 

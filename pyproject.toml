@@ -33,4 +33,5 @@ dependencies = [
     "llama-index-node-parser-docling>=0.4.2",
     "pydantic>=2.10.0",
     "loguru>=0.7.3",
+    "pymupdf4llm>=1.27.2.2",
 ]
