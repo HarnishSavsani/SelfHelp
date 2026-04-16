@@ -851,8 +851,44 @@ class RAGEngine:
         tools = []
 
         if self.vector_index is not None:
-            self.vector_query_engine = self.vector_index.as_query_engine(
-                similarity_top_k=SIMILARITY_TOP_K,
+            from llama_index.core.retrievers import BaseRetriever
+            from llama_index.core.schema import NodeWithScore
+            from llama_index.core.query_engine import RetrieverQueryEngine
+
+            # Create a true Hybrid Retriever combining Vector and BM25 results
+            class HybridRetriever(BaseRetriever):
+                def __init__(self, vector_retriever, bm25_func, thread_id):
+                    self.vector_retriever = vector_retriever
+                    self.bm25_func = bm25_func
+                    self.thread_id = thread_id
+                    super().__init__()
+
+                def _retrieve(self, query_bundle):
+                    vector_nodes = self.vector_retriever.retrieve(query_bundle)
+                    
+                    bm25_nodes = []
+                    if ENABLE_HYBRID_SEARCH:
+                        raw_bm25 = self.bm25_func(query_bundle.query_str, top_k=3)
+                        for n in raw_bm25:
+                            bm25_nodes.append(NodeWithScore(node=n, score=1.0))
+
+                    all_nodes = []
+                    seen_ids = set()
+                    for node in vector_nodes + bm25_nodes:
+                        if node.node.node_id not in seen_ids:
+                            all_nodes.append(node)
+                            seen_ids.add(node.node.node_id)
+                    return all_nodes
+
+            vector_retriever = self.vector_index.as_retriever(similarity_top_k=SIMILARITY_TOP_K)
+            hybrid_retriever = HybridRetriever(
+                vector_retriever=vector_retriever,
+                bm25_func=self._bm25_retrieve,
+                thread_id=self.thread_id
+            )
+
+            self.vector_query_engine = RetrieverQueryEngine.from_args(
+                retriever=hybrid_retriever,
                 llm=self.llm,
                 text_qa_template=DOCUMENT_QA_PROMPT,
             )
@@ -1142,34 +1178,9 @@ class RAGEngine:
         enhanced_question = self._rewrite_query(question, chat_history)
         logger.info(f"[{self.thread_id}] Query: {enhanced_question[:100]}...")
 
-        # ── Step 2: BM25 hybrid retrieval (for document queries) ──
-        bm25_context = ""
-        if ENABLE_HYBRID_SEARCH and self._all_nodes and self.vector_index is not None:
-            bm25_nodes = self._bm25_retrieve(enhanced_question, top_k=3)
-            if bm25_nodes:
-                bm25_texts = []
-                for node in bm25_nodes:
-                    text_content = node.get_content()[:500]
-                    source = node.metadata.get("source_filename", "")
-                    page = node.metadata.get("page_label", "")
-                    citation = f" [Source: {source}"
-                    if page:
-                        citation += f", page {page}"
-                    citation += "]"
-                    bm25_texts.append(text_content + citation)
-                bm25_context = "\n\n".join(bm25_texts)
-
-        # ── Step 3: Augment query with BM25 context ──────────────
-        final_query = enhanced_question
-        if bm25_context:
-            final_query = (
-                f"{enhanced_question}\n\n"
-                f"[Additional keyword-matched context for reference:\n"
-                f"{bm25_context}]"
-            )
-
+        # (Hybrid search is now handled natively via the HybridRetriever in the router)
         try:
-            response = await self.router_query_engine.aquery(final_query)
+            response = await self.router_query_engine.aquery(enhanced_question)
             answer   = str(response).strip()
 
             # --- Check metadata for SQL results first ---
